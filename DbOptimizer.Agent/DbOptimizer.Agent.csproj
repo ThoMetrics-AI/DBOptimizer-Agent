@@ -12,6 +12,7 @@
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.5" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.5" />
     <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.5" />
-    <PackageReference Include="SqlBrain.Contracts" Version="1.0.0" />
+    <PackageReference Include="SqlBrain.Contracts" Version="1.0.1" />
   </ItemGroup>
+
 </Project>

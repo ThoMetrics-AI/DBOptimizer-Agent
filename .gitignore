@@ -1,3 +1,6 @@
+# Local developer settings (may contain secrets)
+appsettings.Development.json
+
 # Visual Studio cache
 .vs/
 
