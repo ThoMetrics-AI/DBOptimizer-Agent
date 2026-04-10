@@ -1,4 +1,3 @@
-using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using DbOptimizer.Agent.Configuration;
 using DbOptimizer.Contracts.Dtos;
@@ -23,8 +22,7 @@ public class BackendApiClient
 
         _httpClient.BaseAddress = new Uri(_config.BackendUrl.TrimEnd('/') + '/');
         _httpClient.Timeout = TimeSpan.FromSeconds(_config.HttpTimeoutSeconds);
-        _httpClient.DefaultRequestHeaders.Authorization =
-            new AuthenticationHeaderValue("ApiKey", _config.ApiKey);
+        _httpClient.DefaultRequestHeaders.Add("X-Agent-ApiKey", _config.ApiKey);
     }
 
     /// <summary>
@@ -35,7 +33,8 @@ public class BackendApiClient
     {
         try
         {
-            var response = await _httpClient.GetAsync("api/agent/poll", cancellationToken);
+            var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0";
+            var response = await _httpClient.GetAsync($"api/agent/poll?agentVersion={version}", cancellationToken);
 
             if (response.StatusCode == System.Net.HttpStatusCode.NoContent)
                 return null;
