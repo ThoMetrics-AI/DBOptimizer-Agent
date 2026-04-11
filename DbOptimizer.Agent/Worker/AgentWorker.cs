@@ -87,6 +87,21 @@ public class AgentWorker : BackgroundService
                 var job = poll.PendingJobs[0];
                 await ProcessJobAsync(job, stoppingToken);
             }
+            else if (poll.ReadyToExecuteObjects.Count > 0)
+            {
+                // Objects from an already-running job are ready for benchmarking.
+                // This handles the case where the agent restarted mid-job — the job is
+                // no longer Pending so ProcessJobAsync won't be called, but Claude has
+                // finished and the objects are AwaitingApproval in the poll response.
+                _logger.LogInformation("Submitting metrics for {Count} ready object(s) from running job(s)",
+                    poll.ReadyToExecuteObjects.Count);
+
+                foreach (var obj in poll.ReadyToExecuteObjects)
+                {
+                    await SubmitObjectMetricsAsync(obj.JobId, obj, stoppingToken);
+                }
+                // Loop immediately — don't sleep, there may be more work.
+            }
             else
             {
                 await DelayAsync(_config.PollIntervalSeconds, stoppingToken);
