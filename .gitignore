@@ -65,3 +65,4 @@ nunit-*.xml
 /publish/win-x64
 /DbOptimizer.Agent.Installer/Output/SqlBrainAgentSetup.exe
 /DbOptimizer.Agent/appsettings.Development.json
+/nuget.config
