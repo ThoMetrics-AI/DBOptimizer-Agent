@@ -23,6 +23,10 @@ public class AgentWorker : BackgroundService
 
     private DateTime _lastHeartbeat = DateTime.MinValue;
 
+    // Cached on first successful query; the connected server/database don't change at runtime.
+    private string? _reportedServerName;
+    private string? _reportedDatabaseName;
+
     public AgentWorker(
         BackendApiClient api,
         SqlServerCrawler crawler,
@@ -287,11 +291,28 @@ public class AgentWorker : BackgroundService
         if (DateTime.UtcNow - _lastHeartbeat < interval)
             return;
 
+        // Populate server/database info once; the values never change while the agent is running.
+        if (_reportedServerName is null)
+        {
+            try
+            {
+                var serverInfo = await _crawler.GetServerInfoAsync(stoppingToken);
+                _reportedServerName   = serverInfo.ServerName;
+                _reportedDatabaseName = serverInfo.DatabaseName;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not retrieve SQL Server info for heartbeat — will retry next cycle");
+            }
+        }
+
         var heartbeat = new HeartbeatRequest
         {
             AgentId      = _config.AgentId,
             AgentVersion = GetAgentVersion(),
             MachineName  = Environment.MachineName,
+            ServerName   = _reportedServerName,
+            DatabaseName = _reportedDatabaseName,
         };
 
         var ok = await _api.SendHeartbeatAsync(heartbeat, stoppingToken);
