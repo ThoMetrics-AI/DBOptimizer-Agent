@@ -26,8 +26,8 @@ public class BackendApiClient
     }
 
     /// <summary>
-    /// Polls the backend for a pending job assigned to this agent.
-    /// Returns null if no job is available.
+    /// Polls the backend for pending work.
+    /// Returns null if the response cannot be read.
     /// </summary>
     public async Task<AgentPollResponse?> PollForJobAsync(CancellationToken cancellationToken)
     {
@@ -50,27 +50,48 @@ public class BackendApiClient
     }
 
     /// <summary>
-    /// Submits crawled object definitions to the backend for a given job.
+    /// Posts discovered objects to the backend to create a DiscoverySession.
+    /// Returns the new session ID, or null on failure.
     /// </summary>
-    public async Task<bool> SubmitObjectDefinitionsAsync(int jobId, List<DiscoveredObjectDto> definitions, CancellationToken cancellationToken)
+    public async Task<int?> PostDiscoveryAsync(List<DiscoveredObjectDto> objects, CancellationToken cancellationToken)
     {
         try
         {
-            var request = new PostDiscoveredObjectsRequest { JobId = jobId, Objects = definitions };
-            var response = await _httpClient.PostAsJsonAsync($"api/agent/jobs/{jobId}/definitions", request, cancellationToken);
+            var request = new PostAgentDiscoveryRequest { Objects = objects };
+            var response = await _httpClient.PostAsJsonAsync("api/agent/discovery", request, cancellationToken);
+            response.EnsureSuccessStatusCode();
+            var result = await response.Content.ReadFromJsonAsync<AgentDiscoveryResponse>(cancellationToken: cancellationToken);
+            return result?.DiscoverySessionId;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Error posting discovery results");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Signals the backend that the agent is starting a pending job.
+    /// Transitions the job from Pending to Running.
+    /// </summary>
+    public async Task<bool> StartJobAsync(int jobId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var response = await _httpClient.PostAsync($"api/agent/jobs/{jobId}/start", null, cancellationToken);
             response.EnsureSuccessStatusCode();
             return true;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _logger.LogError(ex, "Error submitting object definitions for job {JobId}", jobId);
+            _logger.LogError(ex, "Error starting job {JobId}", jobId);
             return false;
         }
     }
 
     /// <summary>
     /// Polls the backend for optimized results ready for execution.
-    /// Returns null if no results are ready yet.
+    /// Returns null if no results are ready yet (204 NoContent).
     /// </summary>
     public async Task<List<JobObjectDto>?> PollForResultsAsync(int jobId, CancellationToken cancellationToken)
     {

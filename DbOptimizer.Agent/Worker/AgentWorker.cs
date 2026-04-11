@@ -73,6 +73,14 @@ public class AgentWorker : BackgroundService
                     "to avoid being blocked by a future mandatory update.");
             }
 
+            // Discovery takes priority over job processing when the backend signals it.
+            if (poll.RunDiscovery)
+            {
+                await RunDiscoveryAsync(stoppingToken);
+                // After discovery, loop immediately so the next poll picks up any new work.
+                continue;
+            }
+
             if (poll.PendingJobs.Count > 0)
             {
                 // Process one job per cycle — keeps each iteration bounded.
@@ -89,32 +97,70 @@ public class AgentWorker : BackgroundService
     }
 
     // -------------------------------------------------------------------------
-    // Job processing
+    // Discovery
     // -------------------------------------------------------------------------
 
-    private async Task ProcessJobAsync(JobDto job, CancellationToken stoppingToken)
+    /// <summary>
+    /// Crawls the SQL Server and posts all discovered objects to the backend.
+    /// The backend creates a DiscoverySession and notifies the dashboard via SignalR
+    /// so the user can select which objects to optimize.
+    /// </summary>
+    private async Task RunDiscoveryAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("Processing job {JobId} (DatabaseConnectionId={DbConnId})",
-            job.Id, job.DatabaseConnectionId);
+        _logger.LogInformation("Running discovery: crawling SQL Server objects");
 
         try
         {
-            // Step 1 — crawl the customer database
-            _logger.LogInformation("Job {JobId}: crawling SQL Server objects", job.Id);
             var definitions = await _crawler.CrawlObjectsAsync(stoppingToken);
-            _logger.LogInformation("Job {JobId}: crawled {Count} objects", job.Id, definitions.Count);
+            _logger.LogInformation("Discovery: crawled {Count} objects", definitions.Count);
 
-            // Step 2 — submit definitions to backend (triggers Claude optimization)
-            var submitted = await _api.SubmitObjectDefinitionsAsync(job.Id, definitions, stoppingToken);
-            if (!submitted)
+            var sessionId = await _api.PostDiscoveryAsync(definitions, stoppingToken);
+            if (sessionId is null)
             {
-                _logger.LogError("Job {JobId}: failed to submit object definitions — aborting job", job.Id);
+                _logger.LogError("Discovery: failed to post objects to backend — will retry next cycle");
                 return;
             }
 
-            _logger.LogInformation("Job {JobId}: definitions submitted, waiting for optimization results", job.Id);
+            _logger.LogInformation("Discovery: session {SessionId} created with {Count} objects. " +
+                "Waiting for user to select objects in dashboard.", sessionId, definitions.Count);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("Discovery cancelled");
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Discovery: unhandled exception — returning to polling");
+        }
+    }
 
-            // Step 3 — poll for optimized results
+    // -------------------------------------------------------------------------
+    // Job processing
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Processes a pending job. In the discovery-based flow, JobObjects are already created
+    /// by the backend when the user selects objects from the dashboard.
+    /// The agent only needs to: start the job, wait for Claude to finish, then benchmark.
+    /// </summary>
+    private async Task ProcessJobAsync(JobDto job, CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("Processing job {JobId}", job.Id);
+
+        try
+        {
+            // Step 1 — signal the backend that we are picking up this job
+            var started = await _api.StartJobAsync(job.Id, stoppingToken);
+            if (!started)
+            {
+                _logger.LogError("Job {JobId}: failed to start job — aborting", job.Id);
+                return;
+            }
+
+            _logger.LogInformation("Job {JobId}: started, waiting for optimization results", job.Id);
+
+            // Step 2 — poll for optimized results (Claude runs independently on the backend)
             var results = await PollForResultsWithTimeoutAsync(job.Id, stoppingToken);
             if (results is null)
             {
@@ -124,9 +170,10 @@ public class AgentWorker : BackgroundService
                 return;
             }
 
-            _logger.LogInformation("Job {JobId}: received {Count} optimized objects — submitting metrics", job.Id, results.Count);
+            _logger.LogInformation("Job {JobId}: received {Count} optimized objects — submitting metrics",
+                job.Id, results.Count);
 
-            // Step 4 — execute each object and submit metrics
+            // Step 3 — execute each object and submit metrics
             foreach (var obj in results)
             {
                 await SubmitObjectMetricsAsync(job.Id, obj, stoppingToken);
@@ -137,7 +184,7 @@ public class AgentWorker : BackgroundService
         catch (OperationCanceledException)
         {
             _logger.LogInformation("Job {JobId}: cancelled", job.Id);
-            throw; // propagate so the host can shut down cleanly
+            throw;
         }
         catch (Exception ex)
         {
@@ -159,10 +206,10 @@ public class AgentWorker : BackgroundService
             if (results is not null)
                 return results;
 
-            _logger.LogDebug("Job {JobId}: results not ready, retrying in {Interval}s", jobId, ResultPollInterval.TotalSeconds);
+            _logger.LogDebug("Job {JobId}: results not ready, retrying in {Interval}s",
+                jobId, ResultPollInterval.TotalSeconds);
             await Task.Delay(ResultPollInterval, stoppingToken);
 
-            // Send heartbeat opportunistically while waiting for results.
             await TrySendHeartbeatAsync(stoppingToken);
         }
 
@@ -220,7 +267,6 @@ public class AgentWorker : BackgroundService
             {
                 await _executor.DeployUnderOptimizerSchemaAsync(obj, obj.OptimizedDefinition, stoppingToken);
 
-                // Execute the optimized copy from the [optimizer] schema.
                 var optimizerObj = new JobObjectDto
                 {
                     Id           = obj.Id,
@@ -252,7 +298,6 @@ public class AgentWorker : BackgroundService
             }
             finally
             {
-                // Always remove the optimizer-schema copy, even if execution failed.
                 try
                 {
                     await _executor.RemoveFromOptimizerSchemaAsync(obj, stoppingToken);
@@ -291,7 +336,6 @@ public class AgentWorker : BackgroundService
         if (DateTime.UtcNow - _lastHeartbeat < interval)
             return;
 
-        // Populate server/database info once; the values never change while the agent is running.
         if (_reportedServerName is null)
         {
             try
