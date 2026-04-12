@@ -272,7 +272,7 @@ public class AgentWorker : BackgroundService
         var defaultParamSet = obj.ParameterSets?.FirstOrDefault(p => p.IsDefault)
                               ?? obj.ParameterSets?.FirstOrDefault();
         var parametersJson = defaultParamSet?.ParametersJson ?? string.Empty;
-        var parameterSetId = defaultParamSet?.Id ?? 0;
+        var parameterSetId = defaultParamSet?.Id; // null when no parameter set (views, parameter-less functions)
 
         var results = new List<ExecutionResultDto>();
 
