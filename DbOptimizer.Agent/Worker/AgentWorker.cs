@@ -259,8 +259,8 @@ public class AgentWorker : BackgroundService
                 var definition = obj.OriginalDefinition ?? string.Empty;
                 if (DefinitionContainsParameters(definition))
                 {
-                    _logger.LogWarning(
-                        "Job {JobId}: [{Schema}].[{Object}] is a stored procedure with parameters but no ParameterSet — skipping execution",
+                    _logger.LogError(
+                        "Job {JobId}: [{Schema}].[{Object}] is a stored procedure with parameters but no ParameterSet — cannot execute, marking failed",
                         jobId, obj.SchemaName, obj.ObjectName);
 
                     await _api.ReportExecutionFailedAsync(jobId, obj.Id, "NoParameterSet", stoppingToken);
@@ -372,9 +372,14 @@ public class AgentWorker : BackgroundService
             var ok = await _api.SubmitMetricsAsync(jobId, request, stoppingToken);
             if (!ok)
             {
-                _logger.LogWarning(
-                    "Job {JobId}: failed to submit metrics for [{Schema}].[{Object}]",
+                _logger.LogError(
+                    "Job {JobId}: failed to submit metrics for [{Schema}].[{Object}] — marking object failed",
                     jobId, obj.SchemaName, obj.ObjectName);
+
+                await _api.ReportExecutionFailedAsync(
+                    jobId, obj.Id,
+                    "Failed to submit execution metrics to backend",
+                    stoppingToken);
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
