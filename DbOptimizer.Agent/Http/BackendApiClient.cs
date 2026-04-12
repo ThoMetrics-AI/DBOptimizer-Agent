@@ -18,7 +18,6 @@ public class BackendApiClient
     {
         _httpClient = httpClient;
         _config = config.Value;
-        _logger = logger;
 
         _httpClient.BaseAddress = new Uri(_config.BackendUrl.TrimEnd('/') + '/');
         _httpClient.Timeout = TimeSpan.FromSeconds(_config.HttpTimeoutSeconds);
@@ -26,15 +25,14 @@ public class BackendApiClient
     }
 
     /// <summary>
-    /// Polls the backend for pending work.
+    /// Polls the backend for pending work (POST so the body can carry SQL Server metadata).
     /// Returns null if the response cannot be read.
     /// </summary>
-    public async Task<AgentPollResponse?> PollForJobAsync(CancellationToken cancellationToken)
+    public async Task<AgentPollResponse?> PollForJobAsync(AgentPollRequest request, CancellationToken cancellationToken)
     {
         try
         {
-            var version = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0";
-            var response = await _httpClient.GetAsync($"api/agent/poll?agentVersion={version}", cancellationToken);
+            var response = await _httpClient.PostAsJsonAsync("api/agent/poll", request, cancellationToken);
 
             if (response.StatusCode == System.Net.HttpStatusCode.NoContent)
                 return null;
@@ -91,7 +89,8 @@ public class BackendApiClient
 
     /// <summary>
     /// Polls the backend for optimized results ready for execution.
-    /// Returns null if no results are ready yet (204 NoContent).
+    /// Returns null when no results are ready yet (204 NoContent) or on error.
+    /// Returns an empty list when 200 OK with [] — treat the same as null (keep polling).
     /// </summary>
     public async Task<List<JobObjectDto>?> PollForResultsAsync(int jobId, CancellationToken cancellationToken)
     {
@@ -103,7 +102,13 @@ public class BackendApiClient
                 return null;
 
             response.EnsureSuccessStatusCode();
-            return await response.Content.ReadFromJsonAsync<List<JobObjectDto>>(cancellationToken: cancellationToken);
+            var results = await response.Content.ReadFromJsonAsync<List<JobObjectDto>>(cancellationToken: cancellationToken);
+
+            // Defensive: if the server returns 200 with an empty list treat it as "not ready".
+            if (results is null || results.Count == 0)
+                return null;
+
+            return results;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -126,6 +131,28 @@ public class BackendApiClient
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "Error submitting metrics for job {JobId}", jobId);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Reports that execution of a specific job object failed.
+    /// The backend marks the object Failed and issues a credit refund if applicable.
+    /// </summary>
+    public async Task<bool> ReportExecutionFailedAsync(int jobId, int objectId, string reason, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var response = await _httpClient.PostAsJsonAsync(
+                $"api/agent/jobs/{jobId}/objects/{objectId}/execution-failed",
+                new { reason },
+                cancellationToken);
+            response.EnsureSuccessStatusCode();
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Error reporting execution failure for JobObject {ObjectId}", objectId);
             return false;
         }
     }
