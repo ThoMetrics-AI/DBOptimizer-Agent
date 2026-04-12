@@ -40,7 +40,7 @@ public class BackendApiClient
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadFromJsonAsync<AgentPollResponse>(cancellationToken: cancellationToken);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             _logger.LogError(ex, "Error polling backend for job");
             return null;
@@ -61,7 +61,7 @@ public class BackendApiClient
             var result = await response.Content.ReadFromJsonAsync<AgentDiscoveryResponse>(cancellationToken: cancellationToken);
             return result?.DiscoverySessionId;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             _logger.LogError(ex, "Error posting discovery results");
             return null;
@@ -80,7 +80,7 @@ public class BackendApiClient
             response.EnsureSuccessStatusCode();
             return true;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             _logger.LogError(ex, "Error starting job {JobId}", jobId);
             return false;
@@ -110,7 +110,7 @@ public class BackendApiClient
 
             return results;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             _logger.LogError(ex, "Error polling for results for job {JobId}", jobId);
             return null;
@@ -128,7 +128,7 @@ public class BackendApiClient
             response.EnsureSuccessStatusCode();
             return true;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             _logger.LogError(ex, "Error submitting metrics for job {JobId}", jobId);
             return false;
@@ -150,7 +150,7 @@ public class BackendApiClient
             response.EnsureSuccessStatusCode();
             return true;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             _logger.LogError(ex, "Error reporting execution failure for JobObject {ObjectId}", objectId);
             return false;
@@ -168,7 +168,7 @@ public class BackendApiClient
             response.EnsureSuccessStatusCode();
             return true;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             _logger.LogError(ex, "Error sending heartbeat");
             return false;
