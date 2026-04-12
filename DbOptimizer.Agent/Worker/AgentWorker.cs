@@ -1,4 +1,6 @@
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.RegularExpressions;
 using DbOptimizer.Agent.Configuration;
 using DbOptimizer.Agent.Crawling;
@@ -61,8 +63,11 @@ public class AgentWorker : BackgroundService
             var pollRequest = new AgentPollRequest
             {
                 AgentVersion       = GetAgentVersion(),
-                ServerName         = _reportedServerName,
-                DatabaseName       = _reportedDatabaseName,
+                ServerNameMasked   = _reportedServerName   is not null ? MaskName(_reportedServerName)   : null,
+                DatabaseNameMasked = _reportedDatabaseName is not null ? MaskName(_reportedDatabaseName) : null,
+                ServerDatabaseHash = _reportedServerName   is not null && _reportedDatabaseName is not null
+                                         ? ComputeServerDatabaseHash(_reportedServerName, _reportedDatabaseName)
+                                         : null,
                 SqlServerVersion   = _reportedSqlServerVersion,
                 CompatibilityLevel = _reportedCompatibilityLevel,
             };
@@ -414,10 +419,18 @@ public class AgentWorker : BackgroundService
 
         var heartbeat = new HeartbeatRequest
         {
-            AgentVersion = GetAgentVersion(),
-            MachineName  = Environment.MachineName,
-            ServerName   = _reportedServerName,
-            DatabaseName = _reportedDatabaseName,
+            AgentVersion             = GetAgentVersion(),
+            MachineName              = MaskName(Environment.MachineName),
+            ServerNameMasked         = _reportedServerName   is not null ? MaskName(_reportedServerName)   : null,
+            DatabaseNameMasked       = _reportedDatabaseName is not null ? MaskName(_reportedDatabaseName) : null,
+            ServerDatabaseHash       = _reportedServerName   is not null && _reportedDatabaseName is not null
+                                           ? ComputeServerDatabaseHash(_reportedServerName, _reportedDatabaseName)
+                                           : null,
+            PollIntervalSeconds      = _config.PollIntervalSeconds,
+            HeartbeatIntervalSeconds = _config.HeartbeatIntervalSeconds,
+            HttpTimeoutSeconds       = _config.HttpTimeoutSeconds,
+            SqlServerVersion         = _reportedSqlServerVersion,
+            CompatibilityLevel       = _reportedCompatibilityLevel,
         };
 
         var ok = await _api.SendHeartbeatAsync(heartbeat, stoppingToken);
@@ -443,4 +456,33 @@ public class AgentWorker : BackgroundService
 
     private static Task DelayAsync(int seconds, CancellationToken ct) =>
         Task.Delay(TimeSpan.FromSeconds(seconds), ct);
+
+    /// <summary>
+    /// Masks a name keeping first char + last N chars, rest replaced with '*':
+    ///   ≥ 5 chars : first + last 3  e.g. "SQLSERVER01" → "S*******r01"
+    ///   4 chars   : first + last 1  e.g. "PROD"        → "P**D"
+    ///   3 chars   : first + last 1  e.g. "SRV"         → "S*V"
+    ///   2 chars   : first only      e.g. "DB"          → "D*"
+    ///   1 char    : fully masked    e.g. "A"           → "*"
+    /// </summary>
+    internal static string MaskName(string value) => value.Length switch
+    {
+        0 => value,
+        1 => "*",
+        2 => value[0] + "*",
+        3 => value[0] + "*" + value[^1],
+        4 => value[0] + "**" + value[^1],
+        _ => value[0] + new string('*', value.Length - 4) + value[^3..]
+    };
+
+    /// <summary>
+    /// SHA-256 hex of "serverName|databaseName" (lowercased).
+    /// Computed from original unmasked values. The unique index (AgentId, Hash) scopes it per agent.
+    /// </summary>
+    internal static string ComputeServerDatabaseHash(string serverName, string databaseName)
+    {
+        var input = $"{serverName.ToLowerInvariant()}|{databaseName.ToLowerInvariant()}";
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(input));
+        return Convert.ToHexString(bytes);
+    }
 }
