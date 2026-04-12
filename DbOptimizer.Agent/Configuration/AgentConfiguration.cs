@@ -5,12 +5,6 @@ public class AgentConfiguration
     public const string SectionName = "Agent";
 
     /// <summary>
-    /// The agent's numeric ID assigned by the backend at registration.
-    /// Written to config by the installer or the first-run registration flow.
-    /// </summary>
-    public int AgentId { get; set; }
-
-    /// <summary>
     /// The base URL of the SqlBrain backend API.
     /// Example: https://api.sqlbrain.ai
     /// </summary>

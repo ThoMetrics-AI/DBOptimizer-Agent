@@ -18,6 +18,7 @@ public class BackendApiClient
     {
         _httpClient = httpClient;
         _config = config.Value;
+        _logger = logger;
 
         _httpClient.BaseAddress = new Uri(_config.BackendUrl.TrimEnd('/') + '/');
         _httpClient.Timeout = TimeSpan.FromSeconds(_config.HttpTimeoutSeconds);

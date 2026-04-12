@@ -60,7 +60,6 @@ public class AgentWorker : BackgroundService
 
             var pollRequest = new AgentPollRequest
             {
-                AgentId            = _config.AgentId,
                 AgentVersion       = GetAgentVersion(),
                 ServerName         = _reportedServerName,
                 DatabaseName       = _reportedDatabaseName,
@@ -415,7 +414,6 @@ public class AgentWorker : BackgroundService
 
         var heartbeat = new HeartbeatRequest
         {
-            AgentId      = _config.AgentId,
             AgentVersion = GetAgentVersion(),
             MachineName  = Environment.MachineName,
             ServerName   = _reportedServerName,
