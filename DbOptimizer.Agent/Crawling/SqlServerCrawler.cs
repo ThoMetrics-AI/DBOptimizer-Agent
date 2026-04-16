@@ -227,7 +227,6 @@ public class SqlServerCrawler
     /// <summary>
     /// Returns a dictionary keyed by "schema.name" mapping to parameter metadata for that object.
     /// Queries sys.parameters for names, types, and output flags.
-    /// IsOptional is always false here — the API re-evaluates it via ScriptDOM on the definition text.
     /// Views are excluded — sys.parameters has no rows for them.
     /// Silently swallows SqlException so a permissions issue does not abort the crawl.
     /// </summary>
@@ -295,10 +294,9 @@ public class SqlServerCrawler
 
                 paramList.Add(new DiscoveredParameterDto
                 {
-                    Name       = paramName,
-                    SqlType    = BuildSqlType(typeName, maxLength, precision, scale),
-                    IsOptional = false,  // API overwrites this via ScriptDOM on the definition text
-                    IsOutput   = isOutput
+                    Name     = paramName,
+                    SqlType  = BuildSqlType(typeName, maxLength, precision, scale),
+                    IsOutput = isOutput
                 });
             }
 
