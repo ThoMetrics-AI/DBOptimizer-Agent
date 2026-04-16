@@ -66,6 +66,7 @@ public class SqlServerCrawler
         var serverInfo       = await GetServerInfoAsync(cancellationToken);
         var frequencies      = await GetProcedureFrequenciesAsync(cancellationToken);
         var permanentWriters = await GetObjectsWithPermanentWritesAsync(cancellationToken);
+        var parameterMap     = await GetParameterMetadataAsync(cancellationToken);
 
         const string sql = """
             SELECT
@@ -125,6 +126,9 @@ public class SqlServerCrawler
                 ExecutionFrequencyPerDay  = frequency > 0 ? frequency : null,
                 FrequencySourceId         = frequency > 0 ? 1 : null, // 1 = FrequencySourceIds.DatabaseDMV
                 HasPermanentTableWrites   = permanentWriters.Contains($"{schemaName}.{objectName}"),
+                Parameters               = parameterMap.TryGetValue($"{schemaName}.{objectName}", out var parameters)
+                                               ? parameters
+                                               : [],
             });
         }
 
@@ -218,6 +222,153 @@ public class SqlServerCrawler
         }
 
         return result;
+    }
+
+    // Matches a parameter declaration in a CREATE PROCEDURE/FUNCTION header.
+    // Captures: name (@something), type info (everything after the name up to the next comma/AS/WITH/BEGIN),
+    // and optionally a default value (= <anything>).
+    // Used to detect IsOptional — sys.parameters.has_default_value is always 0 for T-SQL objects.
+    private static readonly Regex ParameterDefaultRegex = new(
+        @"(@\w+)\s+[^=,]+\s*=\s*",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Returns a dictionary keyed by "schema.name" mapping to parameter metadata for that object.
+    /// Queries sys.parameters for names and types, then parses the definition text to detect
+    /// which parameters have defaults (IsOptional = true).
+    /// Views are excluded — sys.parameters has no rows for them.
+    /// Silently swallows SqlException so a permissions issue does not abort the crawl.
+    /// </summary>
+    private async Task<Dictionary<string, List<DiscoveredParameterDto>>> GetParameterMetadataAsync(
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT
+                s.name                                        AS SchemaName,
+                o.name                                        AS ObjectName,
+                p.name                                        AS ParameterName,
+                TYPE_NAME(p.user_type_id)                     AS TypeName,
+                p.max_length,
+                p.precision,
+                p.scale,
+                p.is_output,
+                m.definition                                  AS ObjectDefinition
+            FROM sys.parameters p
+            JOIN sys.objects  o ON o.object_id = p.object_id
+            JOIN sys.schemas  s ON s.schema_id  = o.schema_id
+            JOIN sys.sql_modules m ON m.object_id = o.object_id
+            WHERE o.is_ms_shipped = 0
+              AND o.type IN ('P', 'FN', 'IF', 'TF')
+              AND p.parameter_id > 0  -- exclude return value (parameter_id = 0 on functions)
+            ORDER BY s.name, o.name, p.parameter_id
+            """;
+
+        var result = new Dictionary<string, List<DiscoveredParameterDto>>(StringComparer.OrdinalIgnoreCase);
+        // Cache parsed optional-param sets per object to avoid re-parsing the definition for every row
+        var optionalCache = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            await using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken);
+
+            await using var command = new SqlCommand(sql, connection);
+            command.CommandTimeout = 120;
+
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+            int colSchema     = reader.GetOrdinal("SchemaName");
+            int colObject     = reader.GetOrdinal("ObjectName");
+            int colParam      = reader.GetOrdinal("ParameterName");
+            int colType       = reader.GetOrdinal("TypeName");
+            int colMaxLen     = reader.GetOrdinal("max_length");
+            int colPrecision  = reader.GetOrdinal("precision");
+            int colScale      = reader.GetOrdinal("scale");
+            int colIsOutput   = reader.GetOrdinal("is_output");
+            int colDefinition = reader.GetOrdinal("ObjectDefinition");
+
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var schemaName  = reader.GetString(colSchema);
+                var objectName  = reader.GetString(colObject);
+                var paramName   = reader.GetString(colParam);
+                var typeName    = reader.GetString(colType);
+                var maxLength   = reader.GetInt16(colMaxLen);
+                var precision   = reader.GetByte(colPrecision);
+                var scale       = reader.GetByte(colScale);
+                var isOutput    = reader.GetBoolean(colIsOutput);
+                var definition  = reader.GetString(colDefinition);
+
+                var key = $"{schemaName}.{objectName}";
+
+                if (!result.TryGetValue(key, out var paramList))
+                {
+                    paramList = [];
+                    result[key] = paramList;
+                }
+
+                // Build the optional-param set for this object on first encounter
+                if (!optionalCache.TryGetValue(key, out var optionalParams))
+                {
+                    optionalParams = ParseOptionalParameters(definition);
+                    optionalCache[key] = optionalParams;
+                }
+
+                paramList.Add(new DiscoveredParameterDto
+                {
+                    Name       = paramName,
+                    SqlType    = BuildSqlType(typeName, maxLength, precision, scale),
+                    IsOptional = optionalParams.Contains(paramName),
+                    IsOutput   = isOutput
+                });
+            }
+
+            _logger.LogDebug("Retrieved parameter metadata for {Count} objects", result.Count);
+        }
+        catch (SqlException ex)
+        {
+            _logger.LogWarning(ex,
+                "Could not query sys.parameters — parameter metadata will not be populated.");
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Parses the CREATE header of a stored procedure or function definition and returns
+    /// the names of all parameters that have a default value (i.e. are optional).
+    /// sys.parameters.has_default_value is always 0 for T-SQL objects, so definition
+    /// parsing is the only reliable way to detect optional parameters.
+    /// </summary>
+    private static HashSet<string> ParseOptionalParameters(string definition)
+    {
+        var optional = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (Match m in ParameterDefaultRegex.Matches(definition))
+            optional.Add(m.Groups[1].Value);
+        return optional;
+    }
+
+    /// <summary>
+    /// Builds a human-readable SQL type string from the sys.parameters type columns,
+    /// e.g. "VARCHAR(100)", "DECIMAL(18,4)", "NVARCHAR(MAX)".
+    /// </summary>
+    private static string BuildSqlType(string typeName, short maxLength, byte precision, byte scale)
+    {
+        var upper = typeName.ToUpperInvariant();
+
+        return upper switch
+        {
+            "VARCHAR" or "CHAR" or "VARBINARY" or "BINARY"
+                => maxLength == -1 ? $"{upper}(MAX)" : $"{upper}({maxLength})",
+            "NVARCHAR" or "NCHAR"
+                // nvarchar stores 2 bytes per char; sys.parameters reports byte length
+                => maxLength == -1 ? $"{upper}(MAX)" : $"{upper}({maxLength / 2})",
+            "DECIMAL" or "NUMERIC"
+                => $"{upper}({precision},{scale})",
+            "FLOAT"
+                => precision > 0 ? $"FLOAT({precision})" : "FLOAT",
+            _ => upper
+        };
     }
 
     /// <summary>

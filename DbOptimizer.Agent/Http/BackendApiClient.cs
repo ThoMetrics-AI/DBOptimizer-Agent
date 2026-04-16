@@ -137,6 +137,45 @@ public class BackendApiClient
     }
 
     /// <summary>
+    /// Returns all non-skipped job objects for a job with their parameter sets.
+    /// Called by the agent immediately after starting a job so it knows what to execute
+    /// and with what parameters during the baseline phase.
+    /// </summary>
+    public async Task<List<JobObjectDto>?> GetJobObjectsAsync(int jobId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var response = await _httpClient.GetAsync($"api/agent/jobs/{jobId}/objects", cancellationToken);
+            response.EnsureSuccessStatusCode();
+            return await response.Content.ReadFromJsonAsync<List<JobObjectDto>>(cancellationToken: cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogError(ex, "Error fetching job objects for job {JobId}", jobId);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Posts baseline execution results (original objects run with user-supplied parameters).
+    /// The backend stores execution plan XML on each JobObject and transitions objects to Optimizing.
+    /// </summary>
+    public async Task<bool> SubmitBaselinesAsync(int jobId, PostBaselineResultsRequest request, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var response = await _httpClient.PostAsJsonAsync($"api/agent/jobs/{jobId}/baselines", request, cancellationToken);
+            response.EnsureSuccessStatusCode();
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogError(ex, "Error submitting baselines for job {JobId}", jobId);
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Reports that execution of a specific job object failed.
     /// The backend marks the object Failed and issues a credit refund if applicable.
     /// </summary>

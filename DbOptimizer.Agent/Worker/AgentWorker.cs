@@ -176,7 +176,22 @@ public class AgentWorker : BackgroundService
                 return;
             }
 
-            _logger.LogInformation("Job {JobId}: started, waiting for optimization results", job.Id);
+            // Phase 1: Fetch job objects with parameter sets and run baseline executions.
+            // This captures actual execution plans so Claude can optimize with full context.
+            var jobObjects = await _api.GetJobObjectsAsync(job.Id, stoppingToken);
+            if (jobObjects is null)
+            {
+                _logger.LogError("Job {JobId}: failed to fetch job objects — aborting", job.Id);
+                return;
+            }
+
+            _logger.LogInformation("Job {JobId}: running baseline executions for {Count} objects",
+                job.Id, jobObjects.Count);
+
+            await RunBaselineExecutionsAsync(job.Id, jobObjects, stoppingToken);
+
+            // Phase 2: Poll for Claude's optimized results.
+            _logger.LogInformation("Job {JobId}: baselines complete, waiting for optimization results", job.Id);
 
             var results = await PollForResultsWithTimeoutAsync(job.Id, stoppingToken);
             if (results is null)
@@ -187,12 +202,13 @@ public class AgentWorker : BackgroundService
                 return;
             }
 
-            _logger.LogInformation("Job {JobId}: received {Count} optimized objects — submitting metrics",
+            _logger.LogInformation("Job {JobId}: received {Count} optimized objects — submitting benchmarks",
                 job.Id, results.Count);
 
+            // Phase 3: Execute optimized versions only (originals already captured in baseline).
             foreach (var obj in results)
             {
-                await SubmitObjectMetricsAsync(job.Id, obj, stoppingToken);
+                await SubmitOptimizedMetricsAsync(job.Id, obj, stoppingToken);
             }
 
             _logger.LogInformation("Job {JobId}: completed", job.Id);
@@ -205,6 +221,91 @@ public class AgentWorker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Job {JobId}: unhandled exception — returning to polling", job.Id);
+        }
+    }
+
+    /// <summary>
+    /// Runs the original definition of each job object with its parameter sets,
+    /// captures execution plan XML and metrics, then posts them to the baselines endpoint.
+    /// The backend stores the plan on the JobObject and transitions it to Optimizing.
+    /// Objects that fail baseline execution are reported via execution-failed.
+    /// </summary>
+    private async Task RunBaselineExecutionsAsync(
+        int jobId,
+        List<JobObjectDto> jobObjects,
+        CancellationToken stoppingToken)
+    {
+        var baselineResults = new List<BaselineObjectResult>();
+
+        foreach (var obj in jobObjects)
+        {
+            var defaultParamSet = obj.ParameterSets?.FirstOrDefault(p => p.IsDefault)
+                                  ?? obj.ParameterSets?.FirstOrDefault();
+            var parametersJson  = defaultParamSet?.ParametersJson ?? string.Empty;
+
+            try
+            {
+                var metrics = new List<BaselineExecutionMetric>();
+                string? bestPlanXml = null;
+
+                // Run with each parameter set; use the default set's plan for Claude context.
+                var setsToRun = obj.ParameterSets?.Count > 0
+                    ? obj.ParameterSets
+                    : [new ParameterSetDto { Id = 0, JobObjectId = obj.Id, Label = "Default", ParametersJson = string.Empty, IsDefault = true }];
+
+                foreach (var paramSet in setsToRun)
+                {
+                    var captured = await _executor.ExecuteAndCaptureAsync(
+                        obj, paramSet.ParametersJson ?? string.Empty, stoppingToken);
+
+                    metrics.Add(new BaselineExecutionMetric
+                    {
+                        ParameterSetId          = paramSet.Id,
+                        ExecutionMs             = captured.ExecutionMs,
+                        LogicalReads            = captured.LogicalReads,
+                        CpuTimeMs               = captured.CpuTimeMs,
+                        RowsReturned            = captured.RowsReturned,
+                        MissingIndexSuggestions = string.Join('\n', captured.MissingIndexSuggestions),
+                    });
+
+                    // Keep plan from the default parameter set (or first one)
+                    if (paramSet.IsDefault || bestPlanXml is null)
+                        bestPlanXml = captured.ExecutionPlanXml;
+                }
+
+                baselineResults.Add(new BaselineObjectResult
+                {
+                    JobObjectId    = obj.Id,
+                    ExecutionPlanXml = bestPlanXml,
+                    Metrics        = metrics
+                });
+
+                _logger.LogInformation(
+                    "Job {JobId}: baseline captured for [{Schema}].[{Object}] — {Sets} parameter set(s)",
+                    jobId, obj.SchemaName, obj.ObjectName, metrics.Count);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex,
+                    "Job {JobId}: baseline execution failed for [{Schema}].[{Object}] — reporting failure",
+                    jobId, obj.SchemaName, obj.ObjectName);
+
+                await _api.ReportExecutionFailedAsync(
+                    jobId, obj.Id,
+                    $"Baseline execution failed: {ex.Message}",
+                    stoppingToken);
+            }
+        }
+
+        if (baselineResults.Count > 0)
+        {
+            var ok = await _api.SubmitBaselinesAsync(
+                jobId,
+                new PostBaselineResultsRequest { Results = baselineResults },
+                stoppingToken);
+
+            if (!ok)
+                _logger.LogError("Job {JobId}: failed to submit baseline results to backend", jobId);
         }
     }
 
@@ -232,6 +333,93 @@ public class AgentWorker : BackgroundService
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Executes only the optimized version of a job object and posts metrics.
+    /// Used after the baseline phase — original metrics are already stored on the backend.
+    /// </summary>
+    private async Task SubmitOptimizedMetricsAsync(int jobId, JobObjectDto obj, CancellationToken stoppingToken)
+    {
+        _logger.LogInformation(
+            "Job {JobId}: benchmarking optimized [{Schema}].[{Object}]",
+            jobId, obj.SchemaName, obj.ObjectName);
+
+        var defaultParamSet = obj.ParameterSets?.FirstOrDefault(p => p.IsDefault)
+                              ?? obj.ParameterSets?.FirstOrDefault();
+        var parametersJson  = defaultParamSet?.ParametersJson ?? string.Empty;
+        var parameterSetId  = defaultParamSet?.Id;
+        var results         = new List<ExecutionResultDto>();
+
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(obj.OptimizedDefinition))
+            {
+                try
+                {
+                    await _executor.DeployUnderOptimizerSchemaAsync(obj, obj.OptimizedDefinition, stoppingToken);
+
+                    var optimizerObj = new JobObjectDto
+                    {
+                        Id           = obj.Id,
+                        SchemaName   = "optimizer",
+                        ObjectName   = obj.ObjectName,
+                        ObjectTypeId = obj.ObjectTypeId,
+                    };
+
+                    var optimized = await _executor.ExecuteAndCaptureAsync(optimizerObj, parametersJson, stoppingToken);
+
+                    results.Add(new ExecutionResultDto
+                    {
+                        JobObjectId             = obj.Id,
+                        ParameterSetId          = parameterSetId,
+                        ExecutionVersionId      = 2,
+                        ExecutionMs             = optimized.ExecutionMs,
+                        LogicalReads            = optimized.LogicalReads,
+                        CpuTimeMs               = optimized.CpuTimeMs,
+                        RowsReturned            = optimized.RowsReturned,
+                        ExecutionPlanXml        = optimized.ExecutionPlanXml,
+                        MissingIndexSuggestions = string.Join('\n', optimized.MissingIndexSuggestions),
+                    });
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "Job {JobId}: optimized execution failed for [{Schema}].[{Object}]",
+                        jobId, obj.SchemaName, obj.ObjectName);
+                }
+                finally
+                {
+                    try { await _executor.RemoveFromOptimizerSchemaAsync(obj, stoppingToken); }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "Job {JobId}: cleanup of [optimizer].[{Object}] failed",
+                            jobId, obj.ObjectName);
+                    }
+                }
+            }
+
+            var request = new PostExecutionResultsRequest { JobObjectId = obj.Id, Results = results };
+            var ok = await _api.SubmitMetricsAsync(jobId, request, stoppingToken);
+            if (!ok)
+            {
+                _logger.LogError(
+                    "Job {JobId}: failed to submit optimized metrics for [{Schema}].[{Object}]",
+                    jobId, obj.SchemaName, obj.ObjectName);
+
+                await _api.ReportExecutionFailedAsync(jobId, obj.Id,
+                    "Failed to submit optimized metrics to backend", stoppingToken);
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Job {JobId}: unexpected error benchmarking [{Schema}].[{Object}]",
+                jobId, obj.SchemaName, obj.ObjectName);
+
+            await _api.ReportExecutionFailedAsync(jobId, obj.Id,
+                $"Unexpected error: {ex.Message}", stoppingToken);
+        }
     }
 
     /// <summary>
