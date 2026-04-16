@@ -228,8 +228,10 @@ public class SqlServerCrawler
     // Captures: name (@something), type info (everything after the name up to the next comma/AS/WITH/BEGIN),
     // and optionally a default value (= <anything>).
     // Used to detect IsOptional — sys.parameters.has_default_value is always 0 for T-SQL objects.
+    // NOTE: [^\r\n=,]+ intentionally excludes newlines so the type segment cannot cross line boundaries
+    // and accidentally match an = in the procedure body (e.g. assignments, WHERE col = @param).
     private static readonly Regex ParameterDefaultRegex = new(
-        @"(@\w+)\s+[^=,]+\s*=\s*",
+        @"(@\w+)\s+[^\r\n=,]+\s*=\s*",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     /// <summary>
