@@ -355,47 +355,61 @@ public class AgentWorker : BackgroundService
         {
             if (!string.IsNullOrWhiteSpace(obj.OptimizedDefinition))
             {
+                var deployed = false;
                 try
                 {
                     await _executor.DeployUnderOptimizerSchemaAsync(obj, obj.OptimizedDefinition, stoppingToken);
-
-                    var optimizerObj = new JobObjectDto
-                    {
-                        Id           = obj.Id,
-                        SchemaName   = "optimizer",
-                        ObjectName   = obj.ObjectName,
-                        ObjectTypeId = obj.ObjectTypeId,
-                    };
-
-                    var optimized = await _executor.ExecuteAndCaptureAsync(optimizerObj, parametersJson, stoppingToken);
-
-                    results.Add(new ExecutionResultDto
-                    {
-                        JobObjectId             = obj.Id,
-                        ParameterSetId          = parameterSetId,
-                        ExecutionVersionId      = 2,
-                        ExecutionMs             = optimized.ExecutionMs,
-                        LogicalReads            = optimized.LogicalReads,
-                        CpuTimeMs               = optimized.CpuTimeMs,
-                        RowsReturned            = optimized.RowsReturned,
-                        ExecutionPlanXml        = optimized.ExecutionPlanXml,
-                        MissingIndexSuggestions = string.Join('\n', optimized.MissingIndexSuggestions),
-                    });
+                    deployed = true;
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex,
-                        "Job {JobId}: optimized execution failed for [{Schema}].[{Object}]",
-                        jobId, obj.SchemaName, obj.ObjectName);
+                        "Job {JobId}: failed to deploy [optimizer].[{Object}] — skipping optimized benchmark",
+                        jobId, obj.ObjectName);
                 }
-                finally
+
+                if (deployed)
                 {
-                    try { await _executor.RemoveFromOptimizerSchemaAsync(obj, stoppingToken); }
+                    try
+                    {
+                        var optimizerObj = new JobObjectDto
+                        {
+                            Id           = obj.Id,
+                            SchemaName   = "optimizer",
+                            ObjectName   = obj.ObjectName,
+                            ObjectTypeId = obj.ObjectTypeId,
+                        };
+
+                        var optimized = await _executor.ExecuteAndCaptureAsync(optimizerObj, parametersJson, stoppingToken);
+
+                        results.Add(new ExecutionResultDto
+                        {
+                            JobObjectId             = obj.Id,
+                            ParameterSetId          = parameterSetId,
+                            ExecutionVersionId      = 2,
+                            ExecutionMs             = optimized.ExecutionMs,
+                            LogicalReads            = optimized.LogicalReads,
+                            CpuTimeMs               = optimized.CpuTimeMs,
+                            RowsReturned            = optimized.RowsReturned,
+                            ExecutionPlanXml        = optimized.ExecutionPlanXml,
+                            MissingIndexSuggestions = string.Join('\n', optimized.MissingIndexSuggestions),
+                        });
+                    }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning(ex,
-                            "Job {JobId}: cleanup of [optimizer].[{Object}] failed",
-                            jobId, obj.ObjectName);
+                        _logger.LogError(ex,
+                            "Job {JobId}: optimized execution failed for [{Schema}].[{Object}]",
+                            jobId, obj.SchemaName, obj.ObjectName);
+                    }
+                    finally
+                    {
+                        try { await _executor.RemoveFromOptimizerSchemaAsync(obj, stoppingToken); }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex,
+                                "Job {JobId}: cleanup of [optimizer].[{Object}] failed",
+                                jobId, obj.ObjectName);
+                        }
                     }
                 }
             }
@@ -501,52 +515,66 @@ public class AgentWorker : BackgroundService
             // --- Optimized execution ---
             if (!string.IsNullOrWhiteSpace(obj.OptimizedDefinition))
             {
+                var deployed = false;
                 try
                 {
                     await _executor.DeployUnderOptimizerSchemaAsync(obj, obj.OptimizedDefinition, stoppingToken);
-
-                    var optimizerObj = new JobObjectDto
-                    {
-                        Id           = obj.Id,
-                        SchemaName   = "optimizer",
-                        ObjectName   = obj.ObjectName,
-                        ObjectTypeId = obj.ObjectTypeId,
-                    };
-
-                    var optimized = await _executor.ExecuteAndCaptureAsync(optimizerObj, parametersJson, stoppingToken);
-
-                    results.Add(new ExecutionResultDto
-                    {
-                        JobObjectId             = obj.Id,
-                        ParameterSetId          = parameterSetId,
-                        ExecutionVersionId      = 2,
-                        ExecutionMs             = optimized.ExecutionMs,
-                        LogicalReads            = optimized.LogicalReads,
-                        CpuTimeMs               = optimized.CpuTimeMs,
-                        RowsReturned            = optimized.RowsReturned,
-                        ExecutionPlanXml        = optimized.ExecutionPlanXml,
-                        MissingIndexSuggestions = string.Join('\n', optimized.MissingIndexSuggestions),
-                    });
+                    deployed = true;
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex,
-                        "Job {JobId}: optimized execution failed for [{Schema}].[{Object}]",
-                        jobId, obj.SchemaName, obj.ObjectName);
-                    // Optimized execution failure is non-fatal: we still post the original metrics.
+                        "Job {JobId}: failed to deploy [optimizer].[{Object}] — skipping optimized benchmark",
+                        jobId, obj.ObjectName);
                 }
-                finally
+
+                if (deployed)
                 {
-                    // Optimizer schema cleanup always runs, even if optimized execution failed.
                     try
                     {
-                        await _executor.RemoveFromOptimizerSchemaAsync(obj, stoppingToken);
+                        var optimizerObj = new JobObjectDto
+                        {
+                            Id           = obj.Id,
+                            SchemaName   = "optimizer",
+                            ObjectName   = obj.ObjectName,
+                            ObjectTypeId = obj.ObjectTypeId,
+                        };
+
+                        var optimized = await _executor.ExecuteAndCaptureAsync(optimizerObj, parametersJson, stoppingToken);
+
+                        results.Add(new ExecutionResultDto
+                        {
+                            JobObjectId             = obj.Id,
+                            ParameterSetId          = parameterSetId,
+                            ExecutionVersionId      = 2,
+                            ExecutionMs             = optimized.ExecutionMs,
+                            LogicalReads            = optimized.LogicalReads,
+                            CpuTimeMs               = optimized.CpuTimeMs,
+                            RowsReturned            = optimized.RowsReturned,
+                            ExecutionPlanXml        = optimized.ExecutionPlanXml,
+                            MissingIndexSuggestions = string.Join('\n', optimized.MissingIndexSuggestions),
+                        });
                     }
-                    catch (Exception cleanupEx)
+                    catch (Exception ex)
                     {
-                        _logger.LogWarning(cleanupEx,
-                            "Job {JobId}: cleanup of [optimizer].[{Object}] failed — may require manual removal",
-                            jobId, obj.ObjectName);
+                        _logger.LogError(ex,
+                            "Job {JobId}: optimized execution failed for [{Schema}].[{Object}]",
+                            jobId, obj.SchemaName, obj.ObjectName);
+                        // Optimized execution failure is non-fatal: we still post the original metrics.
+                    }
+                    finally
+                    {
+                        // Optimizer schema cleanup always runs, even if optimized execution failed.
+                        try
+                        {
+                            await _executor.RemoveFromOptimizerSchemaAsync(obj, stoppingToken);
+                        }
+                        catch (Exception cleanupEx)
+                        {
+                            _logger.LogWarning(cleanupEx,
+                                "Job {JobId}: cleanup of [optimizer].[{Object}] failed — may require manual removal",
+                                jobId, obj.ObjectName);
+                        }
                     }
                 }
             }

@@ -265,6 +265,11 @@ public class SqlObjectExecutor
         var keyword    = GetObjectKeyword(jobObject.ObjectTypeId);
         var objectName = EscapeIdentifier(jobObject.ObjectName);
 
+        if (!ObjectHeaderRegex.IsMatch(definition))
+            throw new InvalidOperationException(
+                $"Could not locate a CREATE/ALTER {keyword} header in the definition of {objectName}. " +
+                "Unable to rewrite the header for deployment to the [optimizer] schema.");
+
         // Replace the first CREATE/ALTER ... PROCEDURE/FUNCTION/VIEW [schema].[name]
         // with CREATE OR ALTER KEYWORD [optimizer].[name].
         return ObjectHeaderRegex.Replace(
