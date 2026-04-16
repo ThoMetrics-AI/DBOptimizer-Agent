@@ -230,15 +230,22 @@ public class SqlServerCrawler
     /// </summary>
     private async Task<HashSet<string>> GetObjectsWithPermanentWritesAsync(CancellationToken cancellationToken)
     {
+        // sys.dm_sql_referenced_entities is the correct source for is_updated.
+        // sys.sql_expression_dependencies does not have that column.
+        // CROSS APPLY invokes it per object. If the query fails (e.g. broken dependencies
+        // on any object in the database), the catch block returns an empty set so all objects
+        // default to HasPermanentTableWrites = false (safe — they pass through as ReadOnly).
+        // referenced_entity_name NOT LIKE '#%' excludes temp tables.
         const string sql = """
             SELECT DISTINCT
                 s.name AS SchemaName,
                 o.name AS ObjectName
-            FROM sys.sql_expression_dependencies d
-            JOIN sys.objects o ON o.object_id = d.referencing_id
-            JOIN sys.schemas s ON s.schema_id  = o.schema_id
-            WHERE d.is_updated    = 1
-              AND d.referenced_id IS NOT NULL
+            FROM sys.objects o
+            JOIN sys.schemas s ON s.schema_id = o.schema_id
+            CROSS APPLY sys.dm_sql_referenced_entities(
+                QUOTENAME(s.name) + '.' + QUOTENAME(o.name), 'OBJECT') d
+            WHERE d.is_updated = 1
+              AND d.referenced_entity_name NOT LIKE '#%'
               AND o.is_ms_shipped = 0
               AND o.type IN ('P', 'FN', 'IF', 'TF')
             """;
@@ -266,7 +273,8 @@ public class SqlServerCrawler
         catch (SqlException ex)
         {
             _logger.LogWarning(ex,
-                "Could not query sys.sql_expression_dependencies — HasPermanentTableWrites will default to false for all objects.");
+                "Could not query sys.dm_sql_referenced_entities — HasPermanentTableWrites will default to false for all objects. " +
+                "This may be caused by broken dependencies in the database.");
         }
 
         return result;
