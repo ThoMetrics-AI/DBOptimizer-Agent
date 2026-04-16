@@ -224,20 +224,10 @@ public class SqlServerCrawler
         return result;
     }
 
-    // Matches a parameter declaration in a CREATE PROCEDURE/FUNCTION header.
-    // Captures: name (@something), type info (everything after the name up to the next comma/AS/WITH/BEGIN),
-    // and optionally a default value (= <anything>).
-    // Used to detect IsOptional — sys.parameters.has_default_value is always 0 for T-SQL objects.
-    // NOTE: [^\r\n=,]+ intentionally excludes newlines so the type segment cannot cross line boundaries
-    // and accidentally match an = in the procedure body (e.g. assignments, WHERE col = @param).
-    private static readonly Regex ParameterDefaultRegex = new(
-        @"(@\w+)\s+[^\r\n=,]+\s*=\s*",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled);
-
     /// <summary>
     /// Returns a dictionary keyed by "schema.name" mapping to parameter metadata for that object.
-    /// Queries sys.parameters for names and types, then parses the definition text to detect
-    /// which parameters have defaults (IsOptional = true).
+    /// Queries sys.parameters for names, types, and output flags.
+    /// IsOptional is always false here — the API re-evaluates it via ScriptDOM on the definition text.
     /// Views are excluded — sys.parameters has no rows for them.
     /// Silently swallows SqlException so a permissions issue does not abort the crawl.
     /// </summary>
@@ -253,12 +243,10 @@ public class SqlServerCrawler
                 p.max_length,
                 p.precision,
                 p.scale,
-                p.is_output,
-                m.definition                                  AS ObjectDefinition
+                p.is_output
             FROM sys.parameters p
             JOIN sys.objects  o ON o.object_id = p.object_id
             JOIN sys.schemas  s ON s.schema_id  = o.schema_id
-            JOIN sys.sql_modules m ON m.object_id = o.object_id
             WHERE o.is_ms_shipped = 0
               AND o.type IN ('P', 'FN', 'IF', 'TF')
               AND p.parameter_id > 0  -- exclude return value (parameter_id = 0 on functions)
@@ -266,8 +254,6 @@ public class SqlServerCrawler
             """;
 
         var result = new Dictionary<string, List<DiscoveredParameterDto>>(StringComparer.OrdinalIgnoreCase);
-        // Cache parsed optional-param sets per object to avoid re-parsing the definition for every row
-        var optionalCache = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
 
         try
         {
@@ -279,27 +265,25 @@ public class SqlServerCrawler
 
             await using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
-            int colSchema     = reader.GetOrdinal("SchemaName");
-            int colObject     = reader.GetOrdinal("ObjectName");
-            int colParam      = reader.GetOrdinal("ParameterName");
-            int colType       = reader.GetOrdinal("TypeName");
-            int colMaxLen     = reader.GetOrdinal("max_length");
-            int colPrecision  = reader.GetOrdinal("precision");
-            int colScale      = reader.GetOrdinal("scale");
-            int colIsOutput   = reader.GetOrdinal("is_output");
-            int colDefinition = reader.GetOrdinal("ObjectDefinition");
+            int colSchema    = reader.GetOrdinal("SchemaName");
+            int colObject    = reader.GetOrdinal("ObjectName");
+            int colParam     = reader.GetOrdinal("ParameterName");
+            int colType      = reader.GetOrdinal("TypeName");
+            int colMaxLen    = reader.GetOrdinal("max_length");
+            int colPrecision = reader.GetOrdinal("precision");
+            int colScale     = reader.GetOrdinal("scale");
+            int colIsOutput  = reader.GetOrdinal("is_output");
 
             while (await reader.ReadAsync(cancellationToken))
             {
-                var schemaName  = reader.GetString(colSchema);
-                var objectName  = reader.GetString(colObject);
-                var paramName   = reader.GetString(colParam);
-                var typeName    = reader.GetString(colType);
-                var maxLength   = reader.GetInt16(colMaxLen);
-                var precision   = reader.GetByte(colPrecision);
-                var scale       = reader.GetByte(colScale);
-                var isOutput    = reader.GetBoolean(colIsOutput);
-                var definition  = reader.GetString(colDefinition);
+                var schemaName = reader.GetString(colSchema);
+                var objectName = reader.GetString(colObject);
+                var paramName  = reader.GetString(colParam);
+                var typeName   = reader.GetString(colType);
+                var maxLength  = reader.GetInt16(colMaxLen);
+                var precision  = reader.GetByte(colPrecision);
+                var scale      = reader.GetByte(colScale);
+                var isOutput   = reader.GetBoolean(colIsOutput);
 
                 var key = $"{schemaName}.{objectName}";
 
@@ -309,18 +293,11 @@ public class SqlServerCrawler
                     result[key] = paramList;
                 }
 
-                // Build the optional-param set for this object on first encounter
-                if (!optionalCache.TryGetValue(key, out var optionalParams))
-                {
-                    optionalParams = ParseOptionalParameters(definition);
-                    optionalCache[key] = optionalParams;
-                }
-
                 paramList.Add(new DiscoveredParameterDto
                 {
                     Name       = paramName,
                     SqlType    = BuildSqlType(typeName, maxLength, precision, scale),
-                    IsOptional = optionalParams.Contains(paramName),
+                    IsOptional = false,  // API overwrites this via ScriptDOM on the definition text
                     IsOutput   = isOutput
                 });
             }
@@ -334,20 +311,6 @@ public class SqlServerCrawler
         }
 
         return result;
-    }
-
-    /// <summary>
-    /// Parses the CREATE header of a stored procedure or function definition and returns
-    /// the names of all parameters that have a default value (i.e. are optional).
-    /// sys.parameters.has_default_value is always 0 for T-SQL objects, so definition
-    /// parsing is the only reliable way to detect optional parameters.
-    /// </summary>
-    private static HashSet<string> ParseOptionalParameters(string definition)
-    {
-        var optional = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (Match m in ParameterDefaultRegex.Matches(definition))
-            optional.Add(m.Groups[1].Value);
-        return optional;
     }
 
     /// <summary>
