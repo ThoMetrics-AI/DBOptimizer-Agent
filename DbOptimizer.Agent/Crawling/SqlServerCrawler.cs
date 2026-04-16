@@ -63,8 +63,9 @@ public class SqlServerCrawler
     /// </summary>
     public async Task<List<DiscoveredObjectDto>> CrawlObjectsAsync(CancellationToken cancellationToken = default)
     {
-        var serverInfo = await GetServerInfoAsync(cancellationToken);
-        var frequencies = await GetProcedureFrequenciesAsync(cancellationToken);
+        var serverInfo       = await GetServerInfoAsync(cancellationToken);
+        var frequencies      = await GetProcedureFrequenciesAsync(cancellationToken);
+        var permanentWriters = await GetObjectsWithPermanentWritesAsync(cancellationToken);
 
         const string sql = """
             SELECT
@@ -121,8 +122,9 @@ public class SqlServerCrawler
                 SqlServerVersion         = serverInfo.SqlServerVersion,
                 CompatibilityLevel       = serverInfo.CompatibilityLevel,
                 ExistingHints            = hints.Length > 0 ? string.Join("; ", hints) : null,
-                ExecutionFrequencyPerDay = frequency > 0 ? frequency : null,
-                FrequencySourceId        = frequency > 0 ? 1 : null, // 1 = FrequencySourceIds.DatabaseDMV
+                ExecutionFrequencyPerDay  = frequency > 0 ? frequency : null,
+                FrequencySourceId         = frequency > 0 ? 1 : null, // 1 = FrequencySourceIds.DatabaseDMV
+                HasPermanentTableWrites   = permanentWriters.Contains($"{schemaName}.{objectName}"),
             });
         }
 
@@ -213,6 +215,58 @@ public class SqlServerCrawler
             _logger.LogWarning(ex,
                 "Could not query sys.dm_exec_procedure_stats — execution frequencies will not be populated. " +
                 "Ensure the agent's SQL login has VIEW SERVER STATE permission.");
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Returns a set of "schema.name" keys for objects that write to permanent tables,
+    /// determined via sys.sql_expression_dependencies (is_updated = 1).
+    /// referenced_id IS NOT NULL filters to resolved catalog objects only — temp tables (#t)
+    /// and table variables (@t) have no catalog entry and resolve to NULL, so they are excluded.
+    /// Silently swallows SqlException so a permissions issue does not abort the crawl;
+    /// all objects default to HasPermanentTableWrites = false in that case.
+    /// </summary>
+    private async Task<HashSet<string>> GetObjectsWithPermanentWritesAsync(CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT DISTINCT
+                s.name AS SchemaName,
+                o.name AS ObjectName
+            FROM sys.sql_expression_dependencies d
+            JOIN sys.objects o ON o.object_id = d.referencing_id
+            JOIN sys.schemas s ON s.schema_id  = o.schema_id
+            WHERE d.is_updated    = 1
+              AND d.referenced_id IS NOT NULL
+              AND o.is_ms_shipped = 0
+              AND o.type IN ('P', 'FN', 'IF', 'TF')
+            """;
+
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        try
+        {
+            await using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken);
+
+            await using var command = new SqlCommand(sql, connection);
+            command.CommandTimeout = 120;
+
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+            int colSchema = reader.GetOrdinal("SchemaName");
+            int colObject = reader.GetOrdinal("ObjectName");
+
+            while (await reader.ReadAsync(cancellationToken))
+                result.Add($"{reader.GetString(colSchema)}.{reader.GetString(colObject)}");
+
+            _logger.LogDebug("Found {Count} objects with permanent table writes", result.Count);
+        }
+        catch (SqlException ex)
+        {
+            _logger.LogWarning(ex,
+                "Could not query sys.sql_expression_dependencies — HasPermanentTableWrites will default to false for all objects.");
         }
 
         return result;
