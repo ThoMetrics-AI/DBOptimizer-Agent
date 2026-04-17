@@ -249,8 +249,11 @@ public class AgentWorker : BackgroundService
                 string? bestPlanXml = null;
 
                 // Run with each parameter set; use the default set's plan for Claude context.
-                var setsToRun = obj.ParameterSets?.Count > 0
-                    ? obj.ParameterSets
+                // Synthetic set (Id=0) is used only when no real sets exist — store null so
+                // the FK constraint on ExecutionResult.ParameterSetId is not violated.
+                var hasRealParamSets = obj.ParameterSets?.Count > 0;
+                var setsToRun = hasRealParamSets
+                    ? obj.ParameterSets!
                     : [new ParameterSetDto { Id = 0, JobObjectId = obj.Id, Label = "Default", ParametersJson = string.Empty, IsDefault = true }];
 
                 foreach (var paramSet in setsToRun)
@@ -260,7 +263,7 @@ public class AgentWorker : BackgroundService
 
                     metrics.Add(new BaselineExecutionMetric
                     {
-                        ParameterSetId          = paramSet.Id,
+                        ParameterSetId          = hasRealParamSets ? paramSet.Id : null,
                         ExecutionMs             = captured.ExecutionMs,
                         LogicalReads            = captured.LogicalReads,
                         CpuTimeMs               = captured.CpuTimeMs,

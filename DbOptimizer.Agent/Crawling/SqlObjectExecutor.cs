@@ -249,8 +249,12 @@ public class SqlObjectExecutor
         }
 
         var args = string.Join(", ", placeholders);
+        // For scalar functions, wrap in a subquery to avoid SQL Server error 4121.
+        // "SELECT [schema].[fn](args)" fails with non-dbo schemas because SQL Server
+        // ambiguously interprets [schema] as a column name in the outer SELECT list.
+        // The subquery forces schema resolution, eliminating the ambiguity.
         cmd.CommandText = scalar
-            ? $"SELECT {fullName}({args})"
+            ? $"SELECT (SELECT {fullName}({args}))"
             : $"SELECT * FROM {fullName}({args})";
 
         return cmd;
