@@ -225,10 +225,14 @@ public class AgentWorker : BackgroundService
     }
 
     /// <summary>
-    /// Runs the original definition of each job object with its parameter sets,
-    /// captures execution plan XML and metrics, then posts them to the baselines endpoint.
-    /// The backend stores the plan on the JobObject and transitions it to Optimizing.
-    /// Objects that fail baseline execution are reported via execution-failed.
+    /// Fetches the estimated execution plan for each job object using SET SHOWPLAN_XML ON.
+    /// No parameters are required — SQL Server compiles and returns the plan without executing.
+    /// Plans are posted to the baselines endpoint; the backend stores each plan on the JobObject
+    /// and transitions it to Optimizing so the orchestration service can call Claude with full
+    /// execution plan context.
+    /// Execution metrics are NOT captured here — both original and optimized are benchmarked
+    /// together in Phase 3 for a fair side-by-side comparison.
+    /// Objects that fail plan capture are reported via execution-failed.
     /// </summary>
     private async Task RunBaselineExecutionsAsync(
         int jobId,
@@ -239,63 +243,33 @@ public class AgentWorker : BackgroundService
 
         foreach (var obj in jobObjects)
         {
-            var defaultParamSet = obj.ParameterSets?.FirstOrDefault(p => p.IsDefault)
-                                  ?? obj.ParameterSets?.FirstOrDefault();
-            var parametersJson  = defaultParamSet?.ParametersJson ?? string.Empty;
-
+            // Use SHOWPLAN_XML to get the estimated execution plan without executing the object.
+            // This avoids requiring parameter values at this phase — parameters are applied in
+            // Phase 3 when both original and optimized are benchmarked side by side.
             try
             {
-                var metrics = new List<BaselineExecutionMetric>();
-                string? bestPlanXml = null;
-
-                // Run with each parameter set; use the default set's plan for Claude context.
-                // Synthetic set (Id=0) is used only when no real sets exist — store null so
-                // the FK constraint on ExecutionResult.ParameterSetId is not violated.
-                var hasRealParamSets = obj.ParameterSets?.Count > 0;
-                var setsToRun = hasRealParamSets
-                    ? obj.ParameterSets!
-                    : [new ParameterSetDto { Id = 0, JobObjectId = obj.Id, Label = "Default", ParametersJson = string.Empty, IsDefault = true }];
-
-                foreach (var paramSet in setsToRun)
-                {
-                    var captured = await _executor.ExecuteAndCaptureAsync(
-                        obj, paramSet.ParametersJson ?? string.Empty, stoppingToken);
-
-                    metrics.Add(new BaselineExecutionMetric
-                    {
-                        ParameterSetId          = hasRealParamSets ? paramSet.Id : null,
-                        ExecutionMs             = captured.ExecutionMs,
-                        LogicalReads            = captured.LogicalReads,
-                        CpuTimeMs               = captured.CpuTimeMs,
-                        RowsReturned            = captured.RowsReturned,
-                        MissingIndexSuggestions = string.Join('\n', captured.MissingIndexSuggestions),
-                    });
-
-                    // Keep plan from the default parameter set (or first one)
-                    if (paramSet.IsDefault || bestPlanXml is null)
-                        bestPlanXml = captured.ExecutionPlanXml;
-                }
+                var planXml = await _executor.GetEstimatedPlanAsync(obj, stoppingToken);
 
                 baselineResults.Add(new BaselineObjectResult
                 {
-                    JobObjectId    = obj.Id,
-                    ExecutionPlanXml = bestPlanXml,
-                    Metrics        = metrics
+                    JobObjectId      = obj.Id,
+                    ExecutionPlanXml = planXml,
+                    Metrics          = [] // Metrics are captured in Phase 3 for a fair comparison
                 });
 
                 _logger.LogInformation(
-                    "Job {JobId}: baseline captured for [{Schema}].[{Object}] — {Sets} parameter set(s)",
-                    jobId, obj.SchemaName, obj.ObjectName, metrics.Count);
+                    "Job {JobId}: estimated plan captured for [{Schema}].[{Object}]",
+                    jobId, obj.SchemaName, obj.ObjectName);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogError(ex,
-                    "Job {JobId}: baseline execution failed for [{Schema}].[{Object}] — reporting failure",
+                    "Job {JobId}: baseline plan capture failed for [{Schema}].[{Object}] — reporting failure",
                     jobId, obj.SchemaName, obj.ObjectName);
 
                 await _api.ReportExecutionFailedAsync(
                     jobId, obj.Id,
-                    $"Baseline execution failed: {ex.Message}",
+                    $"Baseline plan capture failed: {ex.Message}",
                     stoppingToken);
             }
         }
@@ -339,8 +313,9 @@ public class AgentWorker : BackgroundService
     }
 
     /// <summary>
-    /// Executes only the optimized version of a job object and posts metrics.
-    /// Used after the baseline phase — original metrics are already stored on the backend.
+    /// Executes both the original and optimized versions of a job object at the same point in time
+    /// and posts metrics. Running them together ensures a fair side-by-side comparison with the
+    /// same parameter set, same DB state, and the same cache conditions.
     /// </summary>
     private async Task SubmitOptimizedMetricsAsync(int jobId, JobObjectDto obj, CancellationToken stoppingToken)
     {
@@ -356,6 +331,41 @@ public class AgentWorker : BackgroundService
 
         try
         {
+            // --- Original execution ---
+            // Run the original alongside the optimized version so both are measured at the same
+            // point in time with the same parameters, ensuring a fair side-by-side comparison.
+            CapturedMetrics original;
+            try
+            {
+                original = await _executor.ExecuteAndCaptureAsync(obj, parametersJson, stoppingToken);
+
+                results.Add(new ExecutionResultDto
+                {
+                    JobObjectId             = obj.Id,
+                    ParameterSetId          = parameterSetId,
+                    ExecutionVersionId      = 1,
+                    ExecutionMs             = original.ExecutionMs,
+                    LogicalReads            = original.LogicalReads,
+                    CpuTimeMs               = original.CpuTimeMs,
+                    RowsReturned            = original.RowsReturned,
+                    ExecutionPlanXml        = original.ExecutionPlanXml,
+                    MissingIndexSuggestions = string.Join('\n', original.MissingIndexSuggestions),
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Job {JobId}: original execution failed for [{Schema}].[{Object}] — cannot compare, reporting failure",
+                    jobId, obj.SchemaName, obj.ObjectName);
+
+                await _api.ReportExecutionFailedAsync(
+                    jobId, obj.Id,
+                    $"Original execution failed during benchmarking: {ex.Message}",
+                    stoppingToken);
+                return;
+            }
+
+            // --- Optimized execution ---
             if (!string.IsNullOrWhiteSpace(obj.OptimizedDefinition))
             {
                 var deployed = false;
@@ -403,6 +413,7 @@ public class AgentWorker : BackgroundService
                         _logger.LogError(ex,
                             "Job {JobId}: optimized execution failed for [{Schema}].[{Object}]",
                             jobId, obj.SchemaName, obj.ObjectName);
+                        // Optimized failure is non-fatal — original metrics are still posted.
                     }
                     finally
                     {
@@ -422,11 +433,11 @@ public class AgentWorker : BackgroundService
             if (!ok)
             {
                 _logger.LogError(
-                    "Job {JobId}: failed to submit optimized metrics for [{Schema}].[{Object}]",
+                    "Job {JobId}: failed to submit benchmark metrics for [{Schema}].[{Object}]",
                     jobId, obj.SchemaName, obj.ObjectName);
 
                 await _api.ReportExecutionFailedAsync(jobId, obj.Id,
-                    "Failed to submit optimized metrics to backend", stoppingToken);
+                    "Failed to submit benchmark metrics to backend", stoppingToken);
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)

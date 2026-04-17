@@ -132,6 +132,57 @@ public class SqlObjectExecutor
     }
 
     /// <summary>
+    /// Returns the estimated execution plan XML for the object without executing it.
+    /// Uses SET SHOWPLAN_XML ON so SQL Server compiles and returns the plan without
+    /// touching any data — no parameters are required. Views and functions with no
+    /// parameters are called with an empty argument list; stored procedures are called
+    /// via CommandType.StoredProcedure with no parameters added.
+    /// Returns null if the object does not produce a showplan result set.
+    /// </summary>
+    public async Task<string?> GetEstimatedPlanAsync(
+        JobObjectDto jobObject,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using (var onCmd = new SqlCommand("SET SHOWPLAN_XML ON;", connection))
+        {
+            await onCmd.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        // Build the command with no user parameters — SHOWPLAN_XML compiles without executing,
+        // so missing required parameters are not an error.
+        using var execCmd = BuildExecuteCommand(jobObject, [], connection);
+        execCmd.CommandTimeout = 30;
+
+        string? planXml = null;
+
+        await using var reader = await execCmd.ExecuteReaderAsync(cancellationToken);
+
+        do
+        {
+            // SHOWPLAN_XML returns a single-column result set whose column name contains
+            // "XML Showplan" — the same convention as STATISTICS XML.
+            if (reader.FieldCount == 1 &&
+                reader.GetName(0).Contains("XML Showplan", StringComparison.OrdinalIgnoreCase))
+            {
+                if (await reader.ReadAsync(cancellationToken) && !reader.IsDBNull(0))
+                    planXml = reader.GetString(0);
+
+                continue;
+            }
+
+            // Drain any other result sets (shouldn't appear with SHOWPLAN_XML, but be safe).
+            while (await reader.ReadAsync(cancellationToken)) { }
+        }
+        while (await reader.NextResultAsync(cancellationToken));
+
+        // Connection is disposed here, which automatically resets SHOWPLAN_XML for the session.
+        return planXml;
+    }
+
+    /// <summary>
     /// Creates the [optimizer] schema if absent, rewrites the object header to target
     /// [optimizer].[objectName], then executes as CREATE OR ALTER.
     /// </summary>
