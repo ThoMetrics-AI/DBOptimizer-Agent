@@ -107,7 +107,7 @@ public class AgentWorker : BackgroundService
 
                 foreach (var obj in poll.ReadyToExecuteObjects)
                 {
-                    await SubmitObjectMetricsAsync(obj.JobId, obj, stoppingToken);
+                    await SubmitOptimizedMetricsAsync(obj.JobId, obj, stoppingToken);
                 }
             }
             else
