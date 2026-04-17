@@ -323,65 +323,66 @@ public class AgentWorker : BackgroundService
             "Job {JobId}: benchmarking optimized [{Schema}].[{Object}]",
             jobId, obj.SchemaName, obj.ObjectName);
 
-        var defaultParamSet = obj.ParameterSets?.FirstOrDefault(p => p.IsDefault)
-                              ?? obj.ParameterSets?.FirstOrDefault();
-        var parametersJson  = defaultParamSet?.ParametersJson ?? string.Empty;
-        var parameterSetId  = defaultParamSet?.Id;
-        var results         = new List<ExecutionResultDto>();
+        var hasRealParamSets = obj.ParameterSets?.Count > 0;
+        var paramSetsToRun   = hasRealParamSets
+            ? obj.ParameterSets!
+            : [new ParameterSetDto { Id = 0, JobObjectId = obj.Id, Label = "Default", ParametersJson = string.Empty, IsDefault = true }];
 
-        try
+        var results = new List<ExecutionResultDto>();
+
+        // Deploy the optimized version once — reused across all parameter set runs.
+        var optimizedDeployed = false;
+        if (!string.IsNullOrWhiteSpace(obj.OptimizedDefinition))
         {
-            // --- Original execution ---
-            // Run the original alongside the optimized version so both are measured at the same
-            // point in time with the same parameters, ensuring a fair side-by-side comparison.
-            CapturedMetrics original;
             try
             {
-                original = await _executor.ExecuteAndCaptureAsync(obj, parametersJson, stoppingToken);
-
-                results.Add(new ExecutionResultDto
-                {
-                    JobObjectId             = obj.Id,
-                    ParameterSetId          = parameterSetId,
-                    ExecutionVersionId      = 1,
-                    ExecutionMs             = original.ExecutionMs,
-                    LogicalReads            = original.LogicalReads,
-                    CpuTimeMs               = original.CpuTimeMs,
-                    RowsReturned            = original.RowsReturned,
-                    ExecutionPlanXml        = original.ExecutionPlanXml,
-                    MissingIndexSuggestions = string.Join('\n', original.MissingIndexSuggestions),
-                });
+                await _executor.DeployUnderOptimizerSchemaAsync(obj, obj.OptimizedDefinition, stoppingToken);
+                optimizedDeployed = true;
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex,
-                    "Job {JobId}: original execution failed for [{Schema}].[{Object}] — cannot compare, reporting failure",
-                    jobId, obj.SchemaName, obj.ObjectName);
-
-                await _api.ReportExecutionFailedAsync(
-                    jobId, obj.Id,
-                    $"Original execution failed during benchmarking: {ex.Message}",
-                    stoppingToken);
-                return;
+                    "Job {JobId}: failed to deploy [optimizer].[{Object}] — optimized benchmarks will be skipped",
+                    jobId, obj.ObjectName);
             }
+        }
 
-            // --- Optimized execution ---
-            if (!string.IsNullOrWhiteSpace(obj.OptimizedDefinition))
+        try
+        {
+            foreach (var paramSet in paramSetsToRun)
             {
-                var deployed = false;
+                var parametersJson = paramSet.ParametersJson ?? string.Empty;
+                var parameterSetId = hasRealParamSets ? paramSet.Id : (int?)null;
+
+                // --- Original execution ---
+                CapturedMetrics original;
                 try
                 {
-                    await _executor.DeployUnderOptimizerSchemaAsync(obj, obj.OptimizedDefinition, stoppingToken);
-                    deployed = true;
+                    original = await _executor.ExecuteAndCaptureAsync(obj, parametersJson, stoppingToken);
+
+                    results.Add(new ExecutionResultDto
+                    {
+                        JobObjectId             = obj.Id,
+                        ParameterSetId          = parameterSetId,
+                        ExecutionVersionId      = 1,
+                        ExecutionMs             = original.ExecutionMs,
+                        LogicalReads            = original.LogicalReads,
+                        CpuTimeMs               = original.CpuTimeMs,
+                        RowsReturned            = original.RowsReturned,
+                        ExecutionPlanXml        = original.ExecutionPlanXml,
+                        MissingIndexSuggestions = string.Join('\n', original.MissingIndexSuggestions),
+                    });
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex,
-                        "Job {JobId}: failed to deploy [optimizer].[{Object}] — skipping optimized benchmark",
-                        jobId, obj.ObjectName);
+                        "Job {JobId}: original execution failed for [{Schema}].[{Object}] param set '{Label}' — skipping this set",
+                        jobId, obj.SchemaName, obj.ObjectName, paramSet.Label);
+                    continue; // Skip optimized run for this param set too; move to next
                 }
 
-                if (deployed)
+                // --- Optimized execution ---
+                if (optimizedDeployed)
                 {
                     try
                     {
@@ -411,42 +412,51 @@ public class AgentWorker : BackgroundService
                     catch (Exception ex)
                     {
                         _logger.LogError(ex,
-                            "Job {JobId}: optimized execution failed for [{Schema}].[{Object}]",
-                            jobId, obj.SchemaName, obj.ObjectName);
-                        // Optimized failure is non-fatal — original metrics are still posted.
-                    }
-                    finally
-                    {
-                        try { await _executor.RemoveFromOptimizerSchemaAsync(obj, stoppingToken); }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex,
-                                "Job {JobId}: cleanup of [optimizer].[{Object}] failed",
-                                jobId, obj.ObjectName);
-                        }
+                            "Job {JobId}: optimized execution failed for [{Schema}].[{Object}] param set '{Label}'",
+                            jobId, obj.SchemaName, obj.ObjectName, paramSet.Label);
+                        // Non-fatal — original metrics for this param set are still posted.
                     }
                 }
-            }
-
-            var request = new PostExecutionResultsRequest { JobObjectId = obj.Id, Results = results };
-            var ok = await _api.SubmitMetricsAsync(jobId, request, stoppingToken);
-            if (!ok)
-            {
-                _logger.LogError(
-                    "Job {JobId}: failed to submit benchmark metrics for [{Schema}].[{Object}]",
-                    jobId, obj.SchemaName, obj.ObjectName);
-
-                await _api.ReportExecutionFailedAsync(jobId, obj.Id,
-                    "Failed to submit benchmark metrics to backend", stoppingToken);
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _logger.LogError(ex, "Job {JobId}: unexpected error benchmarking [{Schema}].[{Object}]",
                 jobId, obj.SchemaName, obj.ObjectName);
+        }
+        finally
+        {
+            if (optimizedDeployed)
+            {
+                try { await _executor.RemoveFromOptimizerSchemaAsync(obj, stoppingToken); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Job {JobId}: cleanup of [optimizer].[{Object}] failed",
+                        jobId, obj.ObjectName);
+                }
+            }
+        }
 
+        if (results.Count == 0)
+        {
+            _logger.LogError(
+                "Job {JobId}: no benchmark results captured for [{Schema}].[{Object}] — reporting failure",
+                jobId, obj.SchemaName, obj.ObjectName);
             await _api.ReportExecutionFailedAsync(jobId, obj.Id,
-                $"Unexpected error: {ex.Message}", stoppingToken);
+                "All parameter set executions failed", stoppingToken);
+            return;
+        }
+
+        var request = new PostExecutionResultsRequest { JobObjectId = obj.Id, Results = results };
+        var ok = await _api.SubmitMetricsAsync(jobId, request, stoppingToken);
+        if (!ok)
+        {
+            _logger.LogError(
+                "Job {JobId}: failed to submit benchmark metrics for [{Schema}].[{Object}]",
+                jobId, obj.SchemaName, obj.ObjectName);
+            await _api.ReportExecutionFailedAsync(jobId, obj.Id,
+                "Failed to submit benchmark metrics to backend", stoppingToken);
         }
     }
 
