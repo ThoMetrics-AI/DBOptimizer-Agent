@@ -1,7 +1,6 @@
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.RegularExpressions;
 using DbOptimizer.Agent.Configuration;
 using DbOptimizer.Agent.Crawling;
 using DbOptimizer.Agent.Http;
@@ -23,11 +22,6 @@ public class AgentWorker : BackgroundService
 
     private static readonly TimeSpan ResultPollInterval = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan ResultPollTimeout  = TimeSpan.FromMinutes(30);
-
-    // Regex to detect stored procedure parameters (lines containing @paramName type).
-    private static readonly Regex SpParamRegex = new(
-        @"@[A-Za-z_][A-Za-z0-9_]*\s+\w",
-        RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private DateTime _lastHeartbeat = DateTime.MinValue;
 
@@ -474,27 +468,6 @@ public class AgentWorker : BackgroundService
             "Job {JobId}: executing [{Schema}].[{Object}] (TypeId={TypeId})",
             jobId, obj.SchemaName, obj.ObjectName, obj.ObjectTypeId);
 
-        const int StoredProcedureTypeId = 1; // ObjectTypeIds.StoredProcedure (inlined — Core not referenced)
-
-        // Change 5: Detect missing parameter sets for stored procedures.
-        if (obj.ObjectTypeId == StoredProcedureTypeId)
-        {
-            var hasParamSets = obj.ParameterSets?.Count > 0;
-            if (!hasParamSets)
-            {
-                var definition = obj.OriginalDefinition ?? string.Empty;
-                if (DefinitionContainsParameters(definition))
-                {
-                    _logger.LogError(
-                        "Job {JobId}: [{Schema}].[{Object}] is a stored procedure with parameters but no ParameterSet — cannot execute, marking failed",
-                        jobId, obj.SchemaName, obj.ObjectName);
-
-                    await _api.ReportExecutionFailedAsync(jobId, obj.Id, "NoParameterSet", stoppingToken);
-                    return;
-                }
-            }
-        }
-
         var defaultParamSet = obj.ParameterSets?.FirstOrDefault(p => p.IsDefault)
                               ?? obj.ParameterSets?.FirstOrDefault();
         var parametersJson = defaultParamSet?.ParametersJson ?? string.Empty;
@@ -688,13 +661,6 @@ public class AgentWorker : BackgroundService
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
-
-    /// <summary>
-    /// Returns true if the stored procedure definition contains at least one parameter declaration
-    /// (e.g. @CustomerId INT or @Name NVARCHAR(100)).
-    /// </summary>
-    private static bool DefinitionContainsParameters(string definition)
-        => SpParamRegex.IsMatch(definition);
 
     private static string GetAgentVersion() =>
         Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0";
