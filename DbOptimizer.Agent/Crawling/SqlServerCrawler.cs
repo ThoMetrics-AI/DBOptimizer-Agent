@@ -79,6 +79,7 @@ public class SqlServerCrawler
             JOIN sys.schemas   s ON s.schema_id  = o.schema_id
             WHERE o.type IN ('P', 'V', 'FN', 'IF', 'TF')
               AND o.is_ms_shipped = 0
+              AND s.name <> 'optimizer'
             ORDER BY s.name, o.name
             """;
 
@@ -362,6 +363,7 @@ public class SqlServerCrawler
               AND d.referenced_entity_name NOT LIKE '#%'
               AND o.is_ms_shipped = 0
               AND o.type IN ('P', 'FN', 'IF', 'TF')
+              AND s.name <> 'optimizer'
             """;
 
         var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

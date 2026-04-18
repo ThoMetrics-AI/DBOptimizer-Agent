@@ -47,9 +47,13 @@ public class SqlObjectExecutor
 
     // Matches the CREATE/ALTER header through the schema-qualified object name.
     // Groups: (1) = CREATE [OR ALTER] / ALTER, (2) = keyword, full schema.name match consumed.
+    // Multiline + ^\s* ensures only a CREATE/ALTER that starts its own line is matched,
+    // which prevents false matches inside SQL single-line comments such as
+    // "-- Complete CREATE OR ALTER FUNCTION [optimizer].[Name]" that Claude sometimes
+    // emits at the top of its <optimized_sql> block.
     private static readonly Regex ObjectHeaderRegex = new(
-        @"(CREATE\s+(?:OR\s+ALTER\s+)?|ALTER\s+)(PROCEDURE|PROC|VIEW|FUNCTION)\s+(?:\[?\w+\]?\s*\.\s*)?\[?\w+\]?",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        @"^\s*(CREATE\s+(?:OR\s+ALTER\s+)?|ALTER\s+)(PROCEDURE|PROC|VIEW|FUNCTION)\s+(?:\[?\w+\]?\s*\.\s*)?\[?\w+\]?",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled | RegexOptions.Multiline);
 
     public SqlObjectExecutor(AgentConfiguration configuration, ILogger<SqlObjectExecutor> logger)
     {
@@ -134,9 +138,8 @@ public class SqlObjectExecutor
     /// <summary>
     /// Returns the estimated execution plan XML for the object without executing it.
     /// Uses SET SHOWPLAN_XML ON so SQL Server compiles and returns the plan without
-    /// touching any data — no parameters are required. Views and functions with no
-    /// parameters are called with an empty argument list; stored procedures are called
-    /// via CommandType.StoredProcedure with no parameters added.
+    /// touching any data. Parameters are discovered from sys.parameters and passed as
+    /// NULL so SQL Server can bind and compile the plan for objects with required parameters.
     /// Returns null if the object does not produce a showplan result set.
     /// </summary>
     public async Task<string?> GetEstimatedPlanAsync(
@@ -146,14 +149,20 @@ public class SqlObjectExecutor
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
 
+        // Query sys.parameters BEFORE enabling SHOWPLAN_XML — once SHOWPLAN_XML is ON, every
+        // statement returns a plan result set instead of executing, so catalog queries return
+        // no rows and the parameter dictionary would be empty.
+        var nullParameters = await GetNullParametersAsync(jobObject, connection, cancellationToken);
+
         await using (var onCmd = new SqlCommand("SET SHOWPLAN_XML ON;", connection))
         {
             await onCmd.ExecuteNonQueryAsync(cancellationToken);
         }
 
-        // Build the command with no user parameters — SHOWPLAN_XML compiles without executing,
-        // so missing required parameters are not an error.
-        using var execCmd = BuildExecuteCommand(jobObject, [], connection);
+        // SHOWPLAN_XML compiles without executing, but SQL Server still validates that all
+        // required parameters are supplied. Pass NULL for each parameter so the plan can be
+        // compiled regardless of actual values.
+        using var execCmd = BuildExecuteCommand(jobObject, nullParameters, connection);
         execCmd.CommandTimeout = 30;
 
         string? planXml = null;
@@ -244,6 +253,42 @@ public class SqlObjectExecutor
     // Command building
     // -------------------------------------------------------------------------
 
+    /// <summary>
+    /// Queries sys.parameters for the object and returns a dictionary of parameter name → null.
+    /// Views have no parameters and return an empty dictionary.
+    /// </summary>
+    private static async Task<Dictionary<string, object?>> GetNullParametersAsync(
+        JobObjectDto jobObject,
+        SqlConnection connection,
+        CancellationToken cancellationToken)
+    {
+        if (jobObject.ObjectTypeId == View)
+            return [];
+
+        const string sql = """
+            SELECT p.name
+            FROM sys.parameters p
+            INNER JOIN sys.objects o ON p.object_id = o.object_id
+            INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
+            WHERE s.name = @schema
+              AND o.name = @name
+              AND p.parameter_id > 0
+            ORDER BY p.parameter_id;
+            """;
+
+        var result = new Dictionary<string, object?>();
+
+        await using var cmd = new SqlCommand(sql, connection);
+        cmd.Parameters.AddWithValue("@schema", jobObject.SchemaName);
+        cmd.Parameters.AddWithValue("@name",   jobObject.ObjectName);
+
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            result[reader.GetString(0)] = null;
+
+        return result;
+    }
+
     private static SqlCommand BuildExecuteCommand(
         JobObjectDto jobObject,
         Dictionary<string, object?> parameters,
@@ -300,12 +345,14 @@ public class SqlObjectExecutor
         }
 
         var args = string.Join(", ", placeholders);
-        // For scalar functions, wrap in a subquery to avoid SQL Server error 4121.
-        // "SELECT [schema].[fn](args)" fails with non-dbo schemas because SQL Server
-        // ambiguously interprets [schema] as a column name in the outer SELECT list.
-        // The subquery forces schema resolution, eliminating the ambiguity.
+        // For scalar functions, a plain "SELECT [schema].[fn](args)" triggers SQL Server
+        // error 4121 for any non-dbo schema: the parser ambiguously reads [schema] as a
+        // column reference rather than a UDF qualifier.  Adding a single-row dummy FROM
+        // clause via VALUES gives SQL Server a proper row context, which forces it to
+        // resolve [schema].[fn] as a function call.  This works for dbo and all user
+        // schemas (including [optimizer]).
         cmd.CommandText = scalar
-            ? $"SELECT (SELECT {fullName}({args}))"
+            ? $"SELECT {fullName}({args}) FROM (VALUES(1)) AS _(_)"
             : $"SELECT * FROM {fullName}({args})";
 
         return cmd;
