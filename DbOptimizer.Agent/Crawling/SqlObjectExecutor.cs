@@ -425,9 +425,10 @@ public class SqlObjectExecutor
                 for (int i = 0; i < reader.FieldCount; i++)
                     schema.Add((reader.GetName(i), reader.GetDataTypeName(i)));
 
-                var (h, _, _) = await ResultSetHasher.HashCurrentResultSetAsync(
-                    reader, schema, _logger, jobObject.ObjectName, cancellationToken);
-                hash = h;
+                var hashResult = await ResultSetHasher.HashCurrentResultSetAsync(
+                    reader, schema, _configuration.ChecksumRowThreshold,
+                    _logger, jobObject.ObjectName, cancellationToken);
+                hash = hashResult.Hash;
             }
             else
             {
