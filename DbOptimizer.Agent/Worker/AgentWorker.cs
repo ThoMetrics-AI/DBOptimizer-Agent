@@ -89,9 +89,9 @@ public class AgentWorker : BackgroundService
                     "to avoid being blocked by a future mandatory update.");
             }
 
-            if (poll.RunDiscovery)
+            if (poll.DiscoveryJobId.HasValue)
             {
-                await RunDiscoveryAsync(stoppingToken);
+                await RunDiscoveryAsync(poll.DiscoveryJobId.Value, stoppingToken);
                 continue;
             }
 
@@ -123,16 +123,16 @@ public class AgentWorker : BackgroundService
     // Discovery
     // -------------------------------------------------------------------------
 
-    private async Task RunDiscoveryAsync(CancellationToken stoppingToken)
+    private async Task RunDiscoveryAsync(int jobId, CancellationToken stoppingToken)
     {
-        _logger.LogInformation("Running discovery: crawling SQL Server objects");
+        _logger.LogInformation("Running discovery for job {JobId}: crawling SQL Server objects", jobId);
 
         try
         {
             var definitions = await _crawler.CrawlObjectsAsync(stoppingToken);
             _logger.LogInformation("Discovery: crawled {Count} objects", definitions.Count);
 
-            var sessionId = await _api.PostDiscoveryAsync(definitions, stoppingToken);
+            var sessionId = await _api.PostDiscoveryAsync(jobId, definitions, stoppingToken);
             if (sessionId is null)
             {
                 _logger.LogError("Discovery: failed to post objects to backend — will retry next cycle");

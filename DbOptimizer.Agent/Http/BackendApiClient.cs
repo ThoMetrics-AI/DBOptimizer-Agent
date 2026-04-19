@@ -52,11 +52,11 @@ public class BackendApiClient
     /// Posts discovered objects to the backend to create a DiscoverySession.
     /// Returns the new session ID, or null on failure.
     /// </summary>
-    public async Task<int?> PostDiscoveryAsync(List<DiscoveredObjectDto> objects, CancellationToken cancellationToken)
+    public async Task<int?> PostDiscoveryAsync(int jobId, List<DiscoveredObjectDto> objects, CancellationToken cancellationToken)
     {
         try
         {
-            var request = new PostAgentDiscoveryRequest { Objects = objects };
+            var request = new PostAgentDiscoveryRequest { JobId = jobId, Objects = objects };
             var response = await _httpClient.PostAsJsonAsync("api/agent/discovery", request, cancellationToken);
             response.EnsureSuccessStatusCode();
             var result = await response.Content.ReadFromJsonAsync<AgentDiscoveryResponse>(cancellationToken: cancellationToken);
