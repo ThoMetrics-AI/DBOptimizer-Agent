@@ -389,6 +389,7 @@ public class AgentWorker : BackgroundService
                         };
 
                         var optimized = await _executor.ExecuteAndCaptureAsync(optimizerObj, parametersJson, stoppingToken);
+                        var validation = ExecutionValidation.Compare(original, optimized);
 
                         results.Add(new ExecutionResultDto
                         {
@@ -401,6 +402,10 @@ public class AgentWorker : BackgroundService
                             RowsReturned            = optimized.RowsReturned,
                             ExecutionPlanXml        = optimized.ExecutionPlanXml,
                             MissingIndexSuggestions = string.Join('\n', optimized.MissingIndexSuggestions),
+                            RowCountMatch           = validation.RowCountMatch,
+                            ColumnSchemaMatch       = validation.ColumnSchemaMatch,
+                            ValidationSkipped       = validation.ValidationSkipped,
+                            ValidationSkipReason    = validation.SkipReason,
                         });
                     }
                     catch (Exception ex)

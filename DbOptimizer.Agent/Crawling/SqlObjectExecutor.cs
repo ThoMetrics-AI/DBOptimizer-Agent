@@ -10,6 +10,7 @@ namespace DbOptimizer.Agent.Crawling;
 
 /// <summary>
 /// Performance metrics captured from a single execution of a SQL object.
+/// ColumnSchema is null when the execution produced no data result set (e.g. void procs).
 /// </summary>
 public record CapturedMetrics(
     long ExecutionMs,
@@ -17,7 +18,8 @@ public record CapturedMetrics(
     long CpuTimeMs,
     int RowsReturned,
     string? ExecutionPlanXml,
-    IReadOnlyList<string> MissingIndexSuggestions);
+    IReadOnlyList<string> MissingIndexSuggestions,
+    IReadOnlyList<(string Name, string TypeName)>? ColumnSchema);
 
 /// <summary>
 /// Executes stored procedures, views, and functions against the customer's SQL Server
@@ -95,6 +97,7 @@ public class SqlObjectExecutor
 
         string? planXml = null;
         int rowsReturned = 0;
+        IReadOnlyList<(string Name, string TypeName)>? columnSchema = null;
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         await using var reader = await execCmd.ExecuteReaderAsync(cancellationToken);
@@ -109,6 +112,15 @@ public class SqlObjectExecutor
                     planXml = reader.GetString(0);
 
                 continue;
+            }
+
+            // Capture schema from the first data result set — read metadata only, no row buffering.
+            if (columnSchema is null && reader.FieldCount > 0)
+            {
+                var cols = new List<(string Name, string TypeName)>(reader.FieldCount);
+                for (int i = 0; i < reader.FieldCount; i++)
+                    cols.Add((reader.GetName(i), reader.GetDataTypeName(i)));
+                columnSchema = cols;
             }
 
             while (await reader.ReadAsync(cancellationToken))
@@ -134,7 +146,8 @@ public class SqlObjectExecutor
             CpuTimeMs:              cpuTimeMs,
             RowsReturned:           rowsReturned,
             ExecutionPlanXml:       planXml,
-            MissingIndexSuggestions: missingIndexes);
+            MissingIndexSuggestions: missingIndexes,
+            ColumnSchema:           columnSchema);
     }
 
     /// <summary>
