@@ -70,12 +70,14 @@ public class SqlObjectExecutor
         string parametersJson,
         CancellationToken cancellationToken = default)
     {
-        var parameters = ParseParameters(parametersJson);
         var infoMessages = new List<string>();
 
         await using var connection = new SqlConnection(_connectionString);
         connection.InfoMessage += (_, e) => infoMessages.Add(e.Message);
         await connection.OpenAsync(cancellationToken);
+
+        // Resolve $query-based parameters against the live database before building the command.
+        var parameters = await ResolveParametersAsync(parametersJson, connection, cancellationToken);
 
         const string statsSql = """
             SET STATISTICS IO ON;
@@ -404,6 +406,70 @@ public class SqlObjectExecutor
     // -------------------------------------------------------------------------
     // Parsing
     // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Parses parametersJson and resolves any $query-envelope values by executing their
+    /// sampling query against the live database. Literal values are returned unchanged.
+    /// On query failure, substitutes DBNull and logs a warning so execution can continue.
+    /// </summary>
+    private async Task<Dictionary<string, object?>> ResolveParametersAsync(
+        string parametersJson,
+        SqlConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+        if (string.IsNullOrWhiteSpace(parametersJson))
+            return result;
+
+        using var doc = JsonDocument.Parse(parametersJson);
+
+        foreach (var prop in doc.RootElement.EnumerateObject())
+        {
+            if (prop.Value.ValueKind == JsonValueKind.Object
+                && prop.Value.TryGetProperty("$query", out var queryElement))
+            {
+                var queryText = queryElement.GetString();
+                if (!string.IsNullOrWhiteSpace(queryText))
+                {
+                    result[prop.Name] = await ExecuteScalarSamplingQueryAsync(queryText, connection, cancellationToken);
+                    continue;
+                }
+            }
+
+            result[prop.Name] = prop.Value.ValueKind switch
+            {
+                JsonValueKind.String => prop.Value.GetString(),
+                JsonValueKind.Number => prop.Value.TryGetInt64(out var l) ? (object?)l : prop.Value.GetDouble(),
+                JsonValueKind.True   => true,
+                JsonValueKind.False  => false,
+                JsonValueKind.Null   => null,
+                _                   => prop.Value.GetRawText()
+            };
+        }
+
+        return result;
+    }
+
+    private async Task<object?> ExecuteScalarSamplingQueryAsync(
+        string queryText,
+        SqlConnection connection,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var cmd = new SqlCommand(queryText, connection) { CommandTimeout = 30 };
+            var scalar = await cmd.ExecuteScalarAsync(cancellationToken);
+            return scalar == DBNull.Value ? null : scalar;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Failed to resolve AI-generated $query sampling query — substituting NULL. Query: {Query}",
+                queryText);
+            return DBNull.Value;
+        }
+    }
 
     private static Dictionary<string, object?> ParseParameters(string parametersJson)
     {
