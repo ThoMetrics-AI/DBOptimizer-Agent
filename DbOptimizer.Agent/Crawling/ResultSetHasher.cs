@@ -110,7 +110,7 @@ internal static class ResultSetHasher
         }
         else if (clrType == typeof(byte))
         {
-            hasher.Append(BitConverter.GetBytes(reader.GetByte(ordinal)));
+            hasher.Append([reader.GetByte(ordinal)]);
         }
         else if (clrType == typeof(bool))
         {
