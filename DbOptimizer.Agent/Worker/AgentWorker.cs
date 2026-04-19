@@ -413,11 +413,45 @@ public class AgentWorker : BackgroundService
                         };
 
                         var optimized = await _executor.ExecuteAndCaptureAsync(optimizerObj, parametersJson, stoppingToken);
+
+                        // --- Phase 3: sampled checksum for large result sets ---
+                        // If either side exceeded the row threshold, re-execute both under
+                        // 3-band sampling so large result sets still get a checksum comparison.
+                        var originalForCompare = original;
+                        var optimizedForCompare = optimized;
+
+                        if (original.ChecksumThresholdExceeded && original.ColumnSchema is not null)
+                        {
+                            try
+                            {
+                                var sampledOrig = await _executor.ComputeSampledChecksumAsync(
+                                    obj, parametersJson, original.RowsReturned, stoppingToken);
+                                var sampledOpt  = await _executor.ComputeSampledChecksumAsync(
+                                    optimizerObj, parametersJson, optimized.RowsReturned, stoppingToken);
+
+                                originalForCompare  = original  with { ResultHash = sampledOrig };
+                                optimizedForCompare = optimized with { ResultHash = sampledOpt };
+
+                                _logger.LogDebug(
+                                    "Job {JobId}: sampled checksums computed for [{Schema}].[{Object}]",
+                                    jobId, obj.SchemaName, obj.ObjectName);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex,
+                                    "Job {JobId}: sampled checksum failed for [{Schema}].[{Object}] — skipping checksum comparison",
+                                    jobId, obj.SchemaName, obj.ObjectName);
+                                // ResultHash stays null; Compare will leave ChecksumMatch null.
+                            }
+                        }
+
                         // probeIsDeterministic ?? true: if the probe failed (null), assume deterministic
                         // and run checksum; the IsDeterministic field on the DTO stays null to signal
-                        // the probe didn't complete, so observers can interpret it accordingly.
+                        // the probe didn't complete.
                         var validation = ExecutionValidation.Compare(
-                            original, optimized, isDeterministic: probeIsDeterministic ?? true);
+                            originalForCompare, optimizedForCompare,
+                            isDeterministic: probeIsDeterministic ?? true,
+                            floatEpsilon: _config.FloatEpsilon);
 
                         results.Add(new ExecutionResultDto
                         {
@@ -437,6 +471,8 @@ public class AgentWorker : BackgroundService
                             IsDeterministic                  = probeIsDeterministic,
                             ChecksumMatch                    = validation.ChecksumMatch,
                             ChecksumExcludedImpreciseColumns = validation.ChecksumExcludedImpreciseColumns,
+                            UsedSampledChecksum              = validation.UsedSampledChecksum,
+                            FloatColumnsApproximatelyEqual   = validation.FloatColumnsApproximatelyEqual,
                         });
                     }
                     catch (Exception ex)

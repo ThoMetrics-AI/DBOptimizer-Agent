@@ -11,7 +11,7 @@ namespace DbOptimizer.Agent.Crawling;
 /// <summary>
 /// Performance metrics captured from a single execution of a SQL object.
 /// ColumnSchema is null when the execution produced no data result set (e.g. void procs).
-/// ResultHash is null when there was no data result set to hash.
+/// ResultHash is null when there was no data result set to hash or when the row threshold was exceeded.
 /// </summary>
 public record CapturedMetrics(
     long ExecutionMs,
@@ -22,7 +22,14 @@ public record CapturedMetrics(
     IReadOnlyList<string> MissingIndexSuggestions,
     IReadOnlyList<(string Name, string TypeName)>? ColumnSchema,
     ulong? ResultHash,
-    bool ChecksumExcludedImpreciseColumns);
+    bool ChecksumExcludedImpreciseColumns,
+    /// <summary>True when the row count exceeded the threshold and ResultHash is null.</summary>
+    bool ChecksumThresholdExceeded,
+    /// <summary>
+    /// Up to 500 rows of double? values for each excluded float/real/money column.
+    /// Null when no imprecise columns were present.
+    /// </summary>
+    IReadOnlyList<double?[]>? FloatColumnSample);
 
 /// <summary>
 /// Executes stored procedures, views, and functions against the customer's SQL Server
@@ -31,6 +38,7 @@ public record CapturedMetrics(
 public class SqlObjectExecutor
 {
     private readonly string _connectionString;
+    private readonly AgentConfiguration _configuration;
     private readonly ILogger<SqlObjectExecutor> _logger;
 
     // ObjectTypeId constants — must match ObjectTypeMap in SqlServerCrawler.
@@ -63,6 +71,7 @@ public class SqlObjectExecutor
     public SqlObjectExecutor(AgentConfiguration configuration, ILogger<SqlObjectExecutor> logger)
     {
         _connectionString = configuration.SqlConnectionString;
+        _configuration    = configuration;
         _logger = logger;
     }
 
@@ -103,6 +112,8 @@ public class SqlObjectExecutor
         IReadOnlyList<(string Name, string TypeName)>? columnSchema = null;
         ulong? resultHash = null;
         bool checksumExcludedImprecise = false;
+        bool checksumThresholdExceeded = false;
+        IReadOnlyList<double?[]>? floatColumnSample = null;
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         await using var reader = await execCmd.ExecuteReaderAsync(cancellationToken);
@@ -127,11 +138,14 @@ public class SqlObjectExecutor
                     cols.Add((reader.GetName(i), reader.GetDataTypeName(i)));
                 columnSchema = cols;
 
-                var (hash, excluded, rows) = await ResultSetHasher.HashCurrentResultSetAsync(
-                    reader, columnSchema, _logger, jobObject.ObjectName, cancellationToken);
-                resultHash = hash;
-                checksumExcludedImprecise = excluded;
-                rowsReturned += rows;
+                var hashResult = await ResultSetHasher.HashCurrentResultSetAsync(
+                    reader, columnSchema, _configuration.ChecksumRowThreshold,
+                    _logger, jobObject.ObjectName, cancellationToken);
+                resultHash = hashResult.Hash;
+                checksumExcludedImprecise = hashResult.ExcludedImpreciseColumns;
+                checksumThresholdExceeded = hashResult.ThresholdExceeded;
+                floatColumnSample = hashResult.FloatSample;
+                rowsReturned += hashResult.RowCount;
             }
             else
             {
@@ -163,7 +177,9 @@ public class SqlObjectExecutor
             MissingIndexSuggestions:           missingIndexes,
             ColumnSchema:                      columnSchema,
             ResultHash:                        resultHash,
-            ChecksumExcludedImpreciseColumns:  checksumExcludedImprecise);
+            ChecksumExcludedImpreciseColumns:  checksumExcludedImprecise,
+            ChecksumThresholdExceeded:         checksumThresholdExceeded,
+            FloatColumnSample:                 floatColumnSample);
     }
 
     /// <summary>
@@ -319,6 +335,58 @@ public class SqlObjectExecutor
             jobObject.SchemaName, jobObject.ObjectName, hash1 ?? 0, hash2 ?? 0, isDeterministic);
 
         return isDeterministic;
+    }
+
+    /// <summary>
+    /// Re-executes the object and computes an XxHash64 over a 3-band statistical sample.
+    /// Used after <see cref="ExecuteAndCaptureAsync"/> reports <c>ChecksumThresholdExceeded</c>
+    /// so that large result sets still get a meaningful (sampled) checksum.
+    /// </summary>
+    /// <param name="totalRows">
+    /// Expected row count from the earlier execution — used to position the middle and last bands.
+    /// </param>
+    public async Task<ulong?> ComputeSampledChecksumAsync(
+        JobObjectDto jobObject,
+        string parametersJson,
+        int totalRows,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        var parameters = await ResolveParametersAsync(parametersJson, connection, cancellationToken);
+
+        using var cmd = BuildExecuteCommand(jobObject, parameters, connection);
+        cmd.CommandTimeout = 120;
+
+        ulong? hash = null;
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        do
+        {
+            if (reader.FieldCount == 0)
+            {
+                while (await reader.ReadAsync(cancellationToken)) { }
+                continue;
+            }
+
+            if (hash is null)
+            {
+                var schema = new List<(string Name, string TypeName)>(reader.FieldCount);
+                for (int i = 0; i < reader.FieldCount; i++)
+                    schema.Add((reader.GetName(i), reader.GetDataTypeName(i)));
+
+                hash = await ResultSetHasher.ComputeSampledHashAsync(
+                    reader, schema, totalRows, _logger, jobObject.ObjectName, cancellationToken);
+            }
+            else
+            {
+                while (await reader.ReadAsync(cancellationToken)) { }
+            }
+        }
+        while (await reader.NextResultAsync(cancellationToken));
+
+        return hash;
     }
 
     /// <summary>

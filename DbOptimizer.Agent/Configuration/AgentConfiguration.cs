@@ -37,4 +37,17 @@ public class AgentConfiguration
     /// Default: 30 seconds.
     /// </summary>
     public int HttpTimeoutSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// Maximum result-set row count before exact checksum is replaced by a 3-band sampled checksum.
+    /// Default: 10 000 rows.
+    /// </summary>
+    public int ChecksumRowThreshold { get; set; } = 10_000;
+
+    /// <summary>
+    /// Maximum average absolute difference allowed when comparing excluded floating-point column
+    /// values (float, real, money) between original and optimized result sets.
+    /// Default: 0.0001.
+    /// </summary>
+    public double FloatEpsilon { get; set; } = 0.0001;
 }
