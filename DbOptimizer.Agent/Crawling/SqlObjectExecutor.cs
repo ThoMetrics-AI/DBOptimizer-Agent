@@ -11,6 +11,7 @@ namespace DbOptimizer.Agent.Crawling;
 /// <summary>
 /// Performance metrics captured from a single execution of a SQL object.
 /// ColumnSchema is null when the execution produced no data result set (e.g. void procs).
+/// ResultHash is null when there was no data result set to hash.
 /// </summary>
 public record CapturedMetrics(
     long ExecutionMs,
@@ -19,7 +20,9 @@ public record CapturedMetrics(
     int RowsReturned,
     string? ExecutionPlanXml,
     IReadOnlyList<string> MissingIndexSuggestions,
-    IReadOnlyList<(string Name, string TypeName)>? ColumnSchema);
+    IReadOnlyList<(string Name, string TypeName)>? ColumnSchema,
+    ulong? ResultHash,
+    bool ChecksumExcludedImpreciseColumns);
 
 /// <summary>
 /// Executes stored procedures, views, and functions against the customer's SQL Server
@@ -98,6 +101,8 @@ public class SqlObjectExecutor
         string? planXml = null;
         int rowsReturned = 0;
         IReadOnlyList<(string Name, string TypeName)>? columnSchema = null;
+        ulong? resultHash = null;
+        bool checksumExcludedImprecise = false;
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         await using var reader = await execCmd.ExecuteReaderAsync(cancellationToken);
@@ -114,17 +119,26 @@ public class SqlObjectExecutor
                 continue;
             }
 
-            // Capture schema from the first data result set — read metadata only, no row buffering.
+            // First data result set: capture schema and compute a streaming checksum.
             if (columnSchema is null && reader.FieldCount > 0)
             {
                 var cols = new List<(string Name, string TypeName)>(reader.FieldCount);
                 for (int i = 0; i < reader.FieldCount; i++)
                     cols.Add((reader.GetName(i), reader.GetDataTypeName(i)));
                 columnSchema = cols;
-            }
 
-            while (await reader.ReadAsync(cancellationToken))
-                rowsReturned++;
+                var (hash, excluded, rows) = await ResultSetHasher.HashCurrentResultSetAsync(
+                    reader, columnSchema, _logger, jobObject.ObjectName, cancellationToken);
+                resultHash = hash;
+                checksumExcludedImprecise = excluded;
+                rowsReturned += rows;
+            }
+            else
+            {
+                // Subsequent result sets: count rows only (schema and hash cover the first set).
+                while (await reader.ReadAsync(cancellationToken))
+                    rowsReturned++;
+            }
         }
         while (await reader.NextResultAsync(cancellationToken));
 
@@ -141,13 +155,15 @@ public class SqlObjectExecutor
             sw.ElapsedMilliseconds, cpuTimeMs, logicalReads, rowsReturned);
 
         return new CapturedMetrics(
-            ExecutionMs:            sw.ElapsedMilliseconds,
-            LogicalReads:           logicalReads,
-            CpuTimeMs:              cpuTimeMs,
-            RowsReturned:           rowsReturned,
-            ExecutionPlanXml:       planXml,
-            MissingIndexSuggestions: missingIndexes,
-            ColumnSchema:           columnSchema);
+            ExecutionMs:                       sw.ElapsedMilliseconds,
+            LogicalReads:                      logicalReads,
+            CpuTimeMs:                         cpuTimeMs,
+            RowsReturned:                      rowsReturned,
+            ExecutionPlanXml:                  planXml,
+            MissingIndexSuggestions:           missingIndexes,
+            ColumnSchema:                      columnSchema,
+            ResultHash:                        resultHash,
+            ChecksumExcludedImpreciseColumns:  checksumExcludedImprecise);
     }
 
     /// <summary>
@@ -262,6 +278,97 @@ public class SqlObjectExecutor
         _logger.LogInformation(
             "Dropped [optimizer].[{ObjectName}] from optimizer schema",
             jobObject.ObjectName);
+    }
+
+    // -------------------------------------------------------------------------
+    // Determinism probe
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Executes the original object twice with identical resolved parameter values and compares
+    /// the XxHash64 of each result set.  Returns true if both hashes match (deterministic),
+    /// false if they differ.
+    /// <para>
+    /// Parameters with <c>$query</c> envelopes are resolved once and reused for both runs so
+    /// a randomised sampling query (e.g. <c>ORDER BY NEWID()</c>) does not create a false
+    /// non-determinism signal.  Each run uses its own connection to avoid temp-table conflicts
+    /// between sequential executions.
+    /// </para>
+    /// </summary>
+    public async Task<bool> ProbeIsDeterministicAsync(
+        JobObjectDto jobObject,
+        string parametersJson,
+        CancellationToken cancellationToken = default)
+    {
+        // Resolve $query parameters once on a short-lived connection so both probe runs
+        // receive the exact same argument values.
+        Dictionary<string, object?> parameters;
+        await using (var resolveConn = new SqlConnection(_connectionString))
+        {
+            await resolveConn.OpenAsync(cancellationToken);
+            parameters = await ResolveParametersAsync(parametersJson, resolveConn, cancellationToken);
+        }
+
+        var hash1 = await ExecuteAndComputeHashAsync(jobObject, parameters, cancellationToken);
+        var hash2 = await ExecuteAndComputeHashAsync(jobObject, parameters, cancellationToken);
+
+        var isDeterministic = hash1 == hash2;
+
+        _logger.LogDebug(
+            "Determinism probe [{Schema}].[{Object}]: run1={H1:X16}, run2={H2:X16}, deterministic={Det}",
+            jobObject.SchemaName, jobObject.ObjectName, hash1 ?? 0, hash2 ?? 0, isDeterministic);
+
+        return isDeterministic;
+    }
+
+    /// <summary>
+    /// Lightweight execution that produces only a result-set hash — no statistics, no plan XML.
+    /// Used exclusively for the determinism probe so those runs never pollute ExecutionResults.
+    /// Returns null when the object produces no data result set.
+    /// </summary>
+    private async Task<ulong?> ExecuteAndComputeHashAsync(
+        JobObjectDto jobObject,
+        Dictionary<string, object?> parameters,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        using var cmd = BuildExecuteCommand(jobObject, parameters, connection);
+        cmd.CommandTimeout = 120;
+
+        ulong? hash = null;
+        await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+
+        do
+        {
+            // No SET STATISTICS XML ON here, so there are no XML Showplan result sets.
+            // Skip empty result sets (FieldCount == 0) that some procs emit for DML rows-affected.
+            if (reader.FieldCount == 0)
+            {
+                while (await reader.ReadAsync(cancellationToken)) { }
+                continue;
+            }
+
+            // Hash the first data result set; drain any additional ones.
+            if (hash is null)
+            {
+                var schema = new List<(string Name, string TypeName)>(reader.FieldCount);
+                for (int i = 0; i < reader.FieldCount; i++)
+                    schema.Add((reader.GetName(i), reader.GetDataTypeName(i)));
+
+                var (h, _, _) = await ResultSetHasher.HashCurrentResultSetAsync(
+                    reader, schema, _logger, jobObject.ObjectName, cancellationToken);
+                hash = h;
+            }
+            else
+            {
+                while (await reader.ReadAsync(cancellationToken)) { }
+            }
+        }
+        while (await reader.NextResultAsync(cancellationToken));
+
+        return hash;
     }
 
     // -------------------------------------------------------------------------

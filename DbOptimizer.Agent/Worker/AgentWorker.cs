@@ -341,6 +341,30 @@ public class AgentWorker : BackgroundService
             }
         }
 
+        // --- Determinism probe (runs once per object, before benchmarking) ---
+        // Uses the first parameter set with pre-resolved values so a $query like
+        // "SELECT TOP 1 Id ORDER BY NEWID()" does not produce a false non-determinism signal.
+        bool? probeIsDeterministic = null;
+        try
+        {
+            var probeParamSet = paramSetsToRun[0];
+            probeIsDeterministic = await _executor.ProbeIsDeterministicAsync(
+                obj, probeParamSet.ParametersJson ?? string.Empty, stoppingToken);
+
+            if (probeIsDeterministic == false)
+                _logger.LogWarning(
+                    "Job {JobId}: [{Schema}].[{Object}] produced different checksums on two consecutive " +
+                    "executions — object is non-deterministic, checksum comparison will be skipped",
+                    jobId, obj.SchemaName, obj.ObjectName);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Job {JobId}: determinism probe failed for [{Schema}].[{Object}] — assuming deterministic",
+                jobId, obj.SchemaName, obj.ObjectName);
+            // probeIsDeterministic stays null; benchmarking proceeds with checksum comparison enabled.
+        }
+
         try
         {
             foreach (var paramSet in paramSetsToRun)
@@ -389,23 +413,30 @@ public class AgentWorker : BackgroundService
                         };
 
                         var optimized = await _executor.ExecuteAndCaptureAsync(optimizerObj, parametersJson, stoppingToken);
-                        var validation = ExecutionValidation.Compare(original, optimized);
+                        // probeIsDeterministic ?? true: if the probe failed (null), assume deterministic
+                        // and run checksum; the IsDeterministic field on the DTO stays null to signal
+                        // the probe didn't complete, so observers can interpret it accordingly.
+                        var validation = ExecutionValidation.Compare(
+                            original, optimized, isDeterministic: probeIsDeterministic ?? true);
 
                         results.Add(new ExecutionResultDto
                         {
-                            JobObjectId             = obj.Id,
-                            ParameterSetId          = parameterSetId,
-                            ExecutionVersionId      = 2,
-                            ExecutionMs             = optimized.ExecutionMs,
-                            LogicalReads            = optimized.LogicalReads,
-                            CpuTimeMs               = optimized.CpuTimeMs,
-                            RowsReturned            = optimized.RowsReturned,
-                            ExecutionPlanXml        = optimized.ExecutionPlanXml,
-                            MissingIndexSuggestions = string.Join('\n', optimized.MissingIndexSuggestions),
-                            RowCountMatch           = validation.RowCountMatch,
-                            ColumnSchemaMatch       = validation.ColumnSchemaMatch,
-                            ValidationSkipped       = validation.ValidationSkipped,
-                            ValidationSkipReason    = validation.SkipReason,
+                            JobObjectId                      = obj.Id,
+                            ParameterSetId                   = parameterSetId,
+                            ExecutionVersionId               = 2,
+                            ExecutionMs                      = optimized.ExecutionMs,
+                            LogicalReads                     = optimized.LogicalReads,
+                            CpuTimeMs                        = optimized.CpuTimeMs,
+                            RowsReturned                     = optimized.RowsReturned,
+                            ExecutionPlanXml                 = optimized.ExecutionPlanXml,
+                            MissingIndexSuggestions          = string.Join('\n', optimized.MissingIndexSuggestions),
+                            RowCountMatch                    = validation.RowCountMatch,
+                            ColumnSchemaMatch                = validation.ColumnSchemaMatch,
+                            ValidationSkipped                = validation.ValidationSkipped,
+                            ValidationSkipReason             = validation.SkipReason,
+                            IsDeterministic                  = probeIsDeterministic,
+                            ChecksumMatch                    = validation.ChecksumMatch,
+                            ChecksumExcludedImpreciseColumns = validation.ChecksumExcludedImpreciseColumns,
                         });
                     }
                     catch (Exception ex)
