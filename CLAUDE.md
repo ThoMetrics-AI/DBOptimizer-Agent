@@ -23,15 +23,15 @@ This is the on-premise component of DbOptimizer. It runs inside the customer's f
 
 **Responsibilities:**
 - Poll the DbOptimizer backend API for new optimization jobs
-- Connect to the customer's SQL Server and crawl stored procedures, views, and functions
-- Post discovered object definitions to the backend (which triggers Claude classification and optimization)
+- When no job is pending and no active discovery session exists: crawl the customer's SQL Server and post discovered objects to the backend (`RunDiscovery`)
+- When a job arrives: start the job, fetch its objects and parameter sets, capture estimated execution plans, post them for Claude optimization
 - Poll for Claude's optimized results
 - Deploy each optimized object temporarily under an `[optimizer]` schema
-- Execute both the original and optimized versions under `SET STATISTICS IO/TIME/XML ON` to capture real execution metrics
+- Execute both the original and optimized versions with each parameter set under `SET STATISTICS IO/TIME/XML ON` to capture real execution metrics
 - Clean up the `[optimizer]` schema copy
 - Post execution metrics back to the backend
 
-**Data that leaves the customer network:** Only T-SQL object definitions (code), execution plan XML (structure), and numeric metrics (row counts, execution time, logical reads, CPU time). No row data, no PII.
+**Data that leaves the customer network:** Only T-SQL object definitions (code), execution plan XML (structure), and numeric metrics (row counts, execution time, logical reads, CPU time). No row data, no PII. AI-generated parameter sets contain SQL sampling queries, not actual data values — those queries are resolved against the live database locally.
 
 ---
 
@@ -44,7 +44,7 @@ dboptimizer-agent/
       AgentConfiguration.cs     — Typed config: AgentId, BackendUrl, ApiKey, SqlConnectionString, poll intervals
     Crawling/
       SqlServerCrawler.cs       — Crawls sys.objects/sys.sql_modules, queries DMVs for frequencies
-      SqlObjectExecutor.cs      — Deploys to [optimizer] schema, executes, captures metrics
+      SqlObjectExecutor.cs      — Deploys to [optimizer] schema, executes, captures metrics, resolves $query params
     Http/
       BackendApiClient.cs       — All HTTP calls to the backend API
     Worker/
@@ -58,7 +58,7 @@ dboptimizer-agent/
 
 ### External dependencies
 
-- **`DbOptimizer.Contracts`** — NuGet package from the backend repo. Provides all shared DTOs (`JobDto`, `JobObjectDto`, `DiscoveredObjectDto`, `ExecutionResultDto`), request types, and `AgentPollResponse`. This is the only cross-repo dependency.
+- **`DbOptimizer.Contracts`** — NuGet package from the backend repo. Provides all shared DTOs (`JobDto`, `JobObjectDto`, `ParameterSetDto`, `DiscoveredObjectDto`, `ExecutionResultDto`, `BaselineObjectResult`), request types, and `AgentPollResponse`. This is the only cross-repo dependency.
 - **`Microsoft.Data.SqlClient`** — Direct ADO.NET for all SQL Server access. No ORM.
 - No reference to `DbOptimizer.Core`, `DbOptimizer.Claude`, or `DbOptimizer.Infrastructure`.
 
@@ -93,48 +93,82 @@ The installer writes `AgentId`, `BackendUrl`, `ApiKey`, and `SqlConnectionString
 The top-level poll loop. Runs continuously until cancelled.
 
 **Each iteration:**
-1. `TrySendHeartbeatAsync` — sends `POST /api/agent/heartbeat` if more than `HeartbeatIntervalSeconds` have passed since the last successful heartbeat. Includes `AgentId`, `AgentVersion` (from assembly version), and `MachineName`.
-2. `BackendApiClient.PollForJobAsync` — calls `GET /api/agent/poll?agentVersion=X.Y.Z`. Returns `null` if the HTTP response is `204 NoContent`.
-3. If null → sleep `PollIntervalSeconds` and loop.
-4. Check `poll.MustUpdate` — if true, log critical and **stop the service**. The agent must be updated before it can work again.
-5. Check `poll.UpdateAvailable` — if true, log a warning and continue.
-6. If `poll.PendingJobs.Count > 0` → process the first job (`ProcessJobAsync`). Does not sleep — loops immediately after.
-7. If no pending jobs → sleep and loop.
+1. `TrySendHeartbeatAsync` — sends `POST /api/agent/heartbeat` if more than `HeartbeatIntervalSeconds` have passed. Caches server name, database name, SQL Server version, and compatibility level from the first successful `GetServerInfoAsync` call.
+2. Build `AgentPollRequest` with version and masked server/DB metadata.
+3. `BackendApiClient.PollForJobAsync` — `POST /api/agent/poll` with the request body. Returns `null` on failure or `204 NoContent`.
+4. If null → sleep `PollIntervalSeconds` and loop.
+5. Check `poll.MustUpdate` — if true, log critical and **stop the service**.
+6. Check `poll.UpdateAvailable` — if true, log a warning and continue.
+7. If `poll.RunDiscovery` → `RunDiscoveryAsync` (crawl and post to backend), then `continue`.
+8. If `poll.PendingJobs.Count > 0` → `ProcessJobAsync(poll.PendingJobs[0])`.
+9. Else if `poll.ReadyToExecuteObjects.Count > 0` → `SubmitOptimizedMetricsAsync` for each (handles objects picked up via BenchmarkingComplete poll path).
+10. Else → sleep and loop.
 
-> **Note:** `poll.ReadyToExecuteObjects` from the poll response is currently not consumed. The agent processes execution work via the per-job `/results` polling endpoint inside `ProcessJobAsync`.
+### `RunDiscoveryAsync`
+
+Called when `poll.RunDiscovery == true` (backend has no active discovery session for this agent).
+
+1. `SqlServerCrawler.CrawlObjectsAsync` → `List<DiscoveredObjectDto>`
+2. `BackendApiClient.PostDiscoveryAsync` → `POST /api/agent/discovery`
+3. Backend creates a `DiscoverySession`, fires `DiscoverySessionCreated` SignalR event to navigate the dashboard.
+4. User selects objects in the dashboard to create a job — agent does NOT participate further in discovery.
 
 ### `ProcessJobAsync`
 
-Four sequential steps for each job:
+Three sequential phases for each job:
 
-**Step 1 — Crawl**
-`SqlServerCrawler.CrawlObjectsAsync` → returns `List<DiscoveredObjectDto>`.
+**Phase 1 — Baseline execution plans**
+1. `BackendApiClient.StartJobAsync` → `POST /api/agent/jobs/{jobId}/start` — transitions job `Pending → Running`.
+2. `BackendApiClient.GetJobObjectsAsync` → `GET /api/agent/jobs/{jobId}/objects` — returns all non-skipped objects with their parameter sets.
+3. `RunBaselineExecutionsAsync` — for each object, calls `SqlObjectExecutor.GetEstimatedPlanAsync` (uses `SET SHOWPLAN_XML ON` — no actual execution, no parameters needed).
+4. Successful plan captures are batched and posted via `BackendApiClient.SubmitBaselinesAsync` → `POST /api/agent/jobs/{jobId}/baselines`.
+5. Objects that fail plan capture are reported via `BackendApiClient.ReportExecutionFailedAsync`.
+6. The backend stores the plan XML on each `JobObject` and transitions them to `Optimizing` so the orchestration service calls Claude with full execution plan context.
 
-**Step 2 — Submit definitions**
-`BackendApiClient.SubmitObjectDefinitionsAsync` → `POST /api/agent/jobs/{jobId}/definitions`. This call triggers Layer 1 classification and queues Claude work on the backend. On failure (non-2xx), the job is abandoned and the agent returns to polling.
+**Phase 2 — Poll for optimization results**
+`PollForResultsWithTimeoutAsync` → `GET /api/agent/jobs/{jobId}/results` every **10 seconds**, **30-minute timeout**.
+- Returns `null` when backend responds `204 NoContent` (not ready) or `200 OK` with empty list (treated the same).
+- Returns the list once objects with optimized definitions are ready.
 
-**Step 3 — Poll for results**
-`PollForResultsWithTimeoutAsync` → calls `GET /api/agent/jobs/{jobId}/results` every **10 seconds** with a **30-minute timeout**. Returns `null` on timeout. Sends heartbeats opportunistically while waiting.
+**Phase 3 — Benchmark optimized versions**
+For each `JobObjectDto` in the results: `SubmitOptimizedMetricsAsync`.
 
-> **Known bug:** The backend endpoint always returns `200 OK` with `[]` rather than `204 NoContent` when no results are ready. `PollForResultsAsync` only returns `null` for `204`. This means the agent breaks out of the result-poll loop immediately on the first attempt (receiving an empty list, not null), skips all metrics submission, and logs "received 0 optimized objects". See the backend CLAUDE.md for the fix.
+### `SubmitOptimizedMetricsAsync`
 
-**Step 4 — Execute and post metrics**
-For each `JobObjectDto` in the results list: calls `SubmitObjectMetricsAsync`.
+Executes both original and optimized versions for every parameter set and posts all results together.
 
-### `SubmitObjectMetricsAsync`
+1. Determine parameter sets to use — `obj.ParameterSets` if present, otherwise a synthetic empty set.
+2. Deploy optimized version once: `SqlObjectExecutor.DeployUnderOptimizerSchemaAsync` (reused for all param sets).
+3. For each parameter set:
+   - **Original execution:** `SqlObjectExecutor.ExecuteAndCaptureAsync(obj, parametersJson)` → `ExecutionResultDto` with `ExecutionVersionId = 1`.
+   - If original fails → `continue` to next param set (optimized skipped for this set).
+   - **Optimized execution:** `SqlObjectExecutor.ExecuteAndCaptureAsync(optimizerObj with SchemaName="optimizer", parametersJson)` → `ExecutionResultDto` with `ExecutionVersionId = 2`. Non-fatal — if optimized fails, original metrics are still posted.
+4. Cleanup: `SqlObjectExecutor.RemoveFromOptimizerSchemaAsync` in `finally`.
+5. If `results.Count == 0` → call `ReportExecutionFailedAsync` (triggers credit refund).
+6. `BackendApiClient.SubmitMetricsAsync` → `POST /api/agent/jobs/{jobId}/metrics`.
+7. If submit fails → call `ReportExecutionFailedAsync`.
 
-For each object with an optimized definition:
+> **`SubmitObjectMetricsAsync`** (single-param-set version) still exists in `AgentWorker.cs` but is **dead code** — it is not called anywhere. The current path always goes through `SubmitOptimizedMetricsAsync`.
 
-1. Determine the parameter set to use — picks the `IsDefault` parameter set, or the first one, or an empty parameter set if none exist.
-2. **Execute original:** `SqlObjectExecutor.ExecuteAndCaptureAsync(obj, parametersJson)` — runs against the original schema. Creates an `ExecutionResultDto` with `ExecutionVersionId = 1 (Original)`.
-3. If `OptimizedDefinition` is present:
-   - `SqlObjectExecutor.DeployUnderOptimizerSchemaAsync` — creates the `[optimizer]` schema if absent, rewrites the object's CREATE/ALTER header to target `[optimizer].[name]`, deploys with `CREATE OR ALTER`.
-   - `SqlObjectExecutor.ExecuteAndCaptureAsync` on the `[optimizer]` schema copy. Creates an `ExecutionResultDto` with `ExecutionVersionId = 2 (Optimized)`.
-   - `SqlObjectExecutor.RemoveFromOptimizerSchemaAsync` — drops `[optimizer].[name]`. Always runs (in `finally`), even if optimized execution failed.
-4. `BackendApiClient.SubmitMetricsAsync` → `POST /api/agent/jobs/{jobId}/metrics`.
+---
 
-If the **original** execution fails, the object is skipped entirely (no metrics posted, no optimized execution attempted).  
-If the **optimized** execution fails, the original metrics are still posted.
+## `$query` Convention in Parameter Sets
+
+Parameter sets can contain AI-generated sampling queries instead of literal values. Claude writes these to avoid hardcoding specific data values.
+
+**Format in `ParameterSet.ParametersJson`:**
+```json
+{"@CustomerId": {"$query": "SELECT TOP 1 CustomerId FROM Customers ORDER BY NEWID()"}}
+```
+
+**`ResolveParametersAsync`** in `SqlObjectExecutor` detects this convention:
+- Iterates the JSON object properties.
+- If a value is an object containing `"$query"`, executes that SQL against the live database.
+- Uses the first column of the first row as the resolved value.
+- On failure (query error, null result) — substitutes `NULL` and logs a warning.
+- Non-`$query` values are parsed normally (number, string, bool, etc.).
+
+This ensures no actual data values ever reach Claude or the backend — all resolution happens inside the customer's network.
 
 ---
 
@@ -143,10 +177,10 @@ If the **optimized** execution fails, the original metrics are still posted.
 Connects to the customer SQL Server and returns all crawlable objects.
 
 **`CrawlObjectsAsync` flow:**
-1. `GetServerInfoAsync` — `@@SERVERNAME`, `DB_NAME()`, `@@VERSION`, `CompatibilityLevel` via `DATABASEPROPERTYEX`.
-2. `GetProcedureFrequenciesAsync` — queries `sys.dm_exec_procedure_stats` for estimated executions per day (`SUM(execution_count) / DATEDIFF(DAY, cached_time, GETDATE())`). Only covers stored procedures — views and functions are not in this DMV. Silently swallows `SqlException` (e.g. `VIEW SERVER STATE` permission missing on SQL Express).
+1. `GetServerInfoAsync` — `@@SERVERNAME`, `DB_NAME()`, `@@VERSION`, `CompatibilityLevel` via `DATABASEPROPERTYEX`. Returns a `ServerInfo` record cached on the worker.
+2. `GetProcedureFrequenciesAsync` — queries `sys.dm_exec_procedure_stats` for estimated executions per day (`SUM(execution_count) / DATEDIFF(DAY, cached_time, GETDATE())`). Only covers stored procedures. Silently swallows `SqlException` (e.g. `VIEW SERVER STATE` permission missing on SQL Express).
 3. Main query: `sys.objects JOIN sys.sql_modules JOIN sys.schemas` for types `P, V, FN, IF, TF`, excluding `is_ms_shipped = 1` objects.
-4. For each object: maps the `sys.objects.type` code to an `ObjectTypeId` constant (inlined — Core is not referenced), looks up frequency from the DMV results, runs `ExtractHints` to find `OPTION(...)` and `WITH(...)` clauses via regex, builds a `DiscoveredObjectDto`.
+4. For each object: maps `sys.objects.type` code to `ObjectTypeId` (inlined constants — Core not referenced), looks up frequency, runs `ExtractHints`, crawls parameter metadata via `sys.parameters` for stored procedures, builds a `DiscoveredObjectDto`.
 
 **Object type codes → ObjectTypeId:**
 | sys.objects.type | ObjectTypeId |
@@ -159,15 +193,21 @@ Connects to the customer SQL Server and returns all crawlable objects.
 
 > These constants are inlined in the crawler rather than imported from `DbOptimizer.Core`, because the agent does not reference Core. They must stay in sync with `ObjectTypeIds` in the backend.
 
+**Parameter metadata** is crawled from `sys.parameters` for stored procedures and stored in `DiscoveredObjectDto.Parameters`. The backend's `ParameterOptionalityParser` determines which are optional from the SP definition. This JSON ends up in `JobObject.ParametersJson` and is used by the AI parameter generation feature.
+
 ---
 
 ## `SqlObjectExecutor`
 
 Executes SQL objects and captures performance metrics.
 
+### `GetEstimatedPlanAsync`
+
+Uses `SET SHOWPLAN_XML ON` to get the estimated execution plan without executing the object. No parameters are needed — SQL Server compiles and returns the plan. Returns plan XML string or `null` on failure. Used in Phase 1 (baseline plan capture).
+
 ### `ExecuteAndCaptureAsync`
 
-Runs `SET STATISTICS IO ON; SET STATISTICS TIME ON; SET STATISTICS XML ON;`, then executes the object. Collects:
+Resolves `$query` parameters first via `ResolveParametersAsync`, then runs `SET STATISTICS IO ON; SET STATISTICS TIME ON; SET STATISTICS XML ON;` and executes the object. Collects:
 - `ExecutionMs` — wall-clock time via `Stopwatch`
 - `LogicalReads` — summed from `InfoMessage` events via regex (`logical reads (\d+)`)
 - `CpuTimeMs` — summed from `InfoMessage` events via regex (`CPU time = (\d+) ms`)
@@ -186,8 +226,8 @@ Runs `SET STATISTICS IO ON; SET STATISTICS TIME ON; SET STATISTICS XML ON;`, the
 ### `DeployUnderOptimizerSchemaAsync`
 
 1. Ensures the `[optimizer]` schema exists (`IF NOT EXISTS ... EXEC('CREATE SCHEMA [optimizer]')`).
-2. `RewriteObjectHeader` — replaces the first `CREATE [OR ALTER] PROCEDURE/FUNCTION/VIEW [schema].[name]` in the definition with `CREATE OR ALTER {KEYWORD} [optimizer].[name]` using a compiled regex.
-3. Executes the rewritten DDL as a `SqlCommand`.
+2. `RewriteObjectHeader` — replaces the first `CREATE [OR ALTER] PROCEDURE/FUNCTION/VIEW [schema].[name]` with `CREATE OR ALTER {KEYWORD} [optimizer].[name]` using a compiled regex.
+3. Executes the rewritten DDL.
 
 ### `RemoveFromOptimizerSchemaAsync`
 
@@ -201,10 +241,14 @@ Thin HTTP client. `X-Agent-ApiKey` is added to `DefaultRequestHeaders` at constr
 
 | Method | Endpoint | Returns null/false when |
 |--------|----------|------------------------|
-| `PollForJobAsync` | `GET /api/agent/poll?agentVersion=X` | Any exception, or `204 NoContent` |
-| `SubmitObjectDefinitionsAsync` | `POST /api/agent/jobs/{id}/definitions` | Any exception |
-| `PollForResultsAsync` | `GET /api/agent/jobs/{id}/results` | Any exception, or `204 NoContent` |
+| `PollForJobAsync` | `POST /api/agent/poll` | Any exception, or `204 NoContent` |
+| `PostDiscoveryAsync` | `POST /api/agent/discovery` | Any exception |
+| `StartJobAsync` | `POST /api/agent/jobs/{id}/start` | Any exception |
+| `GetJobObjectsAsync` | `GET /api/agent/jobs/{id}/objects` | Any exception |
+| `SubmitBaselinesAsync` | `POST /api/agent/jobs/{id}/baselines` | Any exception |
+| `PollForResultsAsync` | `GET /api/agent/jobs/{id}/results` | Any exception, `204 NoContent`, or `200 []` |
 | `SubmitMetricsAsync` | `POST /api/agent/jobs/{id}/metrics` | Any exception |
+| `ReportExecutionFailedAsync` | `POST /api/agent/jobs/{id}/objects/{oid}/execution-failed` | Any exception |
 | `SendHeartbeatAsync` | `POST /api/agent/heartbeat` | Any exception |
 
 ---
@@ -214,34 +258,41 @@ Thin HTTP client. `X-Agent-ApiKey` is added to `DefaultRequestHeaders` at constr
 ```
 [idle]
   ↓ poll interval
-GET /api/agent/poll
-  ├─ MustUpdate=true  →  stop service
-  ├─ no pending jobs  →  sleep, loop
-  └─ pending jobs[0] = job J
-        ↓
-CrawlObjectsAsync()
-  → N DiscoveredObjectDtos
-        ↓
-POST /api/agent/jobs/J/definitions
-  → backend transitions job to Running
-  → backend runs Layer 1 classification
-  → NeedsReview objects → Classifying
-  → ReadOnly objects    → Optimizing
-  → HasWrites/Dynamic   → Skipped
-  → JobOrchestrationService picks up Classifying/Optimizing objects
-    and calls Claude (runs independently in backend)
-        ↓
-[poll loop] GET /api/agent/jobs/J/results  (every 10s, 30min timeout)
-  → returns non-null list when AwaitingApproval objects exist
-        ↓
-for each optimized JobObject:
-  ExecuteAndCaptureAsync(original)
-  DeployUnderOptimizerSchemaAsync(optimized)
-  ExecuteAndCaptureAsync([optimizer].[name])
-  RemoveFromOptimizerSchemaAsync
-  POST /api/agent/jobs/J/metrics
-        ↓
-[idle] loop
+POST /api/agent/poll  (body: AgentPollRequest with version + masked server metadata)
+  ├─ MustUpdate=true       →  stop service
+  ├─ RunDiscovery=true     →  CrawlObjectsAsync → POST /api/agent/discovery → continue
+  ├─ PendingJobs[0] = job J  →  ProcessJobAsync(J)
+  │     ↓
+  │   POST /api/agent/jobs/J/start
+  │     ↓
+  │   GET /api/agent/jobs/J/objects  (returns objects + parameter sets)
+  │     ↓
+  │   Phase 1: RunBaselineExecutionsAsync
+  │     for each object: GetEstimatedPlanAsync (SET SHOWPLAN_XML ON — no actual execution)
+  │     POST /api/agent/jobs/J/baselines  (plan XMLs)
+  │       backend: stores plan XML on JobObject, transitions to Optimizing
+  │       JobOrchestrationService: calls Claude with plan context
+  │     ↓
+  │   Phase 2: PollForResultsWithTimeoutAsync  (every 10s, 30min timeout)
+  │     GET /api/agent/jobs/J/results
+  │     → 204 or 200+[] → keep polling
+  │     → 200+objects   → proceed to Phase 3
+  │     ↓
+  │   Phase 3: SubmitOptimizedMetricsAsync for each optimized object
+  │     DeployUnderOptimizerSchemaAsync (once per object)
+  │     for each ParameterSet:
+  │       ExecuteAndCaptureAsync(original)  → ExecutionVersionId=1
+  │       ExecuteAndCaptureAsync([optimizer].[name])  → ExecutionVersionId=2
+  │     RemoveFromOptimizerSchemaAsync
+  │     POST /api/agent/jobs/J/metrics
+  │     (if all param sets failed: POST /api/agent/jobs/J/objects/{id}/execution-failed)
+  │     ↓
+  │   [job complete for this agent]
+  │
+  ├─ ReadyToExecuteObjects.Count > 0  →  SubmitOptimizedMetricsAsync for each
+  │   (handles BenchmarkingComplete jobs picked up via poll without a pending job)
+  │
+  └─ nothing pending  →  sleep PollIntervalSeconds, loop
 ```
 
 ---
@@ -249,15 +300,15 @@ for each optimized JobObject:
 ## Heartbeat Behavior
 
 - Heartbeats fire when `DateTime.UtcNow - _lastHeartbeat >= HeartbeatIntervalSeconds`.
-- They are sent at the **start** of every poll cycle and also **opportunistically** while waiting for results.
-- The poll endpoint (`GET /api/agent/poll`) also records a heartbeat inline on the backend side, so heartbeat calls via `POST /api/agent/heartbeat` are supplementary.
+- They are sent at the **start** of every poll cycle and **opportunistically** while waiting for results.
+- The poll endpoint also records a heartbeat inline on the backend, so `POST /api/agent/heartbeat` is supplementary.
 - A heartbeat failure does not abort the current job — the agent logs a warning and continues.
 
 ---
 
 ## Version Enforcement
 
-The agent sends its version (`Assembly.GetExecutingAssembly().GetName().Version`) as a query parameter on every poll. The backend can respond with `MustUpdate=true` to force the agent to stop. Currently the backend never sets this flag, but the wiring is in place.
+The agent sends its version (`Assembly.GetExecutingAssembly().GetName().Version`) in the `AgentPollRequest` body on every poll. The backend can respond with `MustUpdate=true` to force the agent to stop. Currently the backend never sets this flag, but the wiring is in place.
 
 ---
 
@@ -267,7 +318,8 @@ The agent sends its version (`Assembly.GetExecutingAssembly().GetName().Version`
 - **ObjectTypeId constants are inlined** in `SqlServerCrawler.ObjectTypeMap` because the agent doesn't reference `DbOptimizer.Core`. If you add a new object type to the backend, update both `ObjectTypeIds` in Core and the map here.
 - **Regex for hint extraction** uses two patterns: one for `OPTION(...)` and one for `WITH(...)`. The WITH pattern explicitly lists recognized hint names to avoid matching CTE syntax (`WITH cte AS ...`).
 - **Execution plan XML** is identified by the result set column name containing "XML Showplan" — this is SQL Server's convention for the Statistics XML result set.
-- **Missing index suggestions** are parsed from `<MissingIndexGroup>` elements in the plan XML, extracting equality/inequality/include columns and impact percentage.
-- **CommandTimeout** is 120 seconds for crawl queries, 120 seconds for execution, 60 seconds for deploy, and 30 seconds for drop.
-- **The `[optimizer]` schema** is created in the customer database if absent. It is used as a sandbox for running the optimized version without touching the original object. Always cleaned up in `finally`.
-- **Parameters** are stored as JSON in `ParameterSet.ParametersJson`. The executor parses the JSON and maps JSON value kinds to CLR types. Unknown value kinds are passed as their raw JSON text.
+- **Missing index suggestions** are parsed from `<MissingIndexGroup>` elements in the plan XML.
+- **CommandTimeout**: 120s for crawl queries, 120s for execution, 60s for deploy, 30s for drop.
+- **The `[optimizer]` schema** is created in the customer database if absent. Used as a sandbox for running the optimized version. Always cleaned up in `finally`.
+- **Server/database names** are masked before being sent to the backend: first char + last 3 chars, rest replaced with `*`. A SHA-256 hash of `serverName|databaseName` (lowercased) is also sent for identity matching without revealing the full names.
+- **`SubmitObjectMetricsAsync`** in `AgentWorker.cs` is dead code — it is never called. The active path is `SubmitOptimizedMetricsAsync`.
