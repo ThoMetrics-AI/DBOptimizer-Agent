@@ -41,10 +41,12 @@ This is the on-premise component of DbOptimizer. It runs inside the customer's f
 dboptimizer-agent/
   DbOptimizer.Agent/            — .NET Worker Service (the agent itself)
     Configuration/
-      AgentConfiguration.cs     — Typed config: AgentId, BackendUrl, ApiKey, SqlConnectionString, poll intervals
+      AgentConfiguration.cs     — Typed config: AgentId, BackendUrl, ApiKey, SqlConnectionString, poll intervals, ChecksumRowThreshold, FloatEpsilon
     Crawling/
       SqlServerCrawler.cs       — Crawls sys.objects/sys.sql_modules, queries DMVs for frequencies
       SqlObjectExecutor.cs      — Deploys to [optimizer] schema, executes, captures metrics, resolves $query params
+      ResultSetHasher.cs        — Checksum computation for result sets; supports sampled hashing for large sets
+      ExecutionValidation.cs    — Row count and column schema comparison between original and optimized executions
     Http/
       BackendApiClient.cs       — All HTTP calls to the backend API
     Worker/
@@ -58,7 +60,7 @@ dboptimizer-agent/
 
 ### External dependencies
 
-- **`DbOptimizer.Contracts`** — NuGet package from the backend repo. Provides all shared DTOs (`JobDto`, `JobObjectDto`, `ParameterSetDto`, `DiscoveredObjectDto`, `ExecutionResultDto`, `BaselineObjectResult`), request types, and `AgentPollResponse`. This is the only cross-repo dependency.
+- **`SqlBrain.Contracts`** — NuGet package published from the backend's `DbOptimizer.Contracts` project. Provides all shared DTOs (`JobDto`, `JobObjectDto`, `ParameterSetDto`, `DiscoveredObjectDto`, `ExecutionResultDto`, `BaselineObjectResult`), request types, and `AgentPollResponse`. This is the only cross-repo dependency.
 - **`Microsoft.Data.SqlClient`** — Direct ADO.NET for all SQL Server access. No ORM.
 - No reference to `DbOptimizer.Core`, `DbOptimizer.Claude`, or `DbOptimizer.Infrastructure`.
 
@@ -72,17 +74,19 @@ dboptimizer-agent/
 
 All settings live in `appsettings.json` under the `"Agent"` section (`AgentConfiguration.SectionName`):
 
-| Key | Purpose | Default |
-|-----|---------|---------|
-| `AgentId` | Numeric ID assigned by backend at registration | — |
-| `BackendUrl` | Base URL of the SaaS API, e.g. `https://api.dboptimizer.com` | — |
-| `ApiKey` | API key issued on registration. Sent as `X-Agent-ApiKey` header | — |
-| `SqlConnectionString` | Connection string to the customer SQL Server | — |
-| `PollIntervalSeconds` | How often to poll for new jobs (when idle) | 15 |
-| `HeartbeatIntervalSeconds` | Min interval between heartbeat sends | 60 |
-| `HttpTimeoutSeconds` | Per-request HTTP timeout to backend | 30 |
+| Key | Purpose | Code Default | appsettings.json |
+|-----|---------|-------------|-----------------|
+| `AgentId` | Numeric ID assigned by backend at registration | — | placeholder |
+| `BackendUrl` | Base URL of the SaaS API, e.g. `https://api.dboptimizer.com` | — | placeholder |
+| `ApiKey` | API key issued on registration. Sent as `X-Agent-ApiKey` header | — | placeholder |
+| `SqlConnectionString` | Connection string to the customer SQL Server | — | placeholder |
+| `PollIntervalSeconds` | How often to poll for new jobs (when idle) | 15 | **10** |
+| `HeartbeatIntervalSeconds` | Min interval between heartbeat sends | 60 | **30** |
+| `HttpTimeoutSeconds` | Per-request HTTP timeout to backend | 30 | 30 |
+| `ChecksumRowThreshold` | Max rows before switching to sampled checksum | 10,000 | — |
+| `FloatEpsilon` | Tolerance for comparing floating-point result values | 0.0001 | — |
 
-The installer writes `AgentId`, `BackendUrl`, `ApiKey`, and `SqlConnectionString` on first run. Other values use defaults.
+The installer writes `AgentId`, `BackendUrl`, `ApiKey`, and `SqlConnectionString` on first run. `appsettings.json` in the repo overrides poll and heartbeat intervals to be more aggressive than the code defaults.
 
 ---
 
@@ -235,6 +239,25 @@ Runs `DROP {PROCEDURE|VIEW|FUNCTION} IF EXISTS [optimizer].[name]`. Always calle
 
 ---
 
+## Result Set Validation
+
+When both original and optimized versions execute successfully, the agent validates that the optimized version returns equivalent results. Validation runs inside `SubmitOptimizedMetricsAsync` and populates fields on `ExecutionResultDto`.
+
+**`ExecutionValidation.cs`** — compares:
+- **Row count** (`RowCountMatch`) — original vs. optimized row counts must match exactly.
+- **Column schema** (`ColumnSchemaMatch`) — column names and types must match (order-insensitive).
+- **Checksum** (`ChecksumMatch`) — hash of result data. For non-deterministic objects (random, NEWID, etc.) checksums are skipped and `IsDeterministic=false` is recorded.
+
+**`ResultSetHasher.cs`** — computes checksums:
+- Rows ≤ `ChecksumRowThreshold` (default 10,000): full checksum over all rows.
+- Rows > threshold: sampled checksum; `UsedSampledChecksum=true` is recorded.
+- Float columns are compared with epsilon tolerance (`FloatEpsilon`, default 0.0001). When floats differ only within tolerance, `FloatColumnsApproximatelyEqual=true` is set even if the checksum technically mismatches.
+- When checksum includes columns that were excluded due to imprecise types, `ChecksumExcludedImpreciseColumns=true` is recorded.
+
+Validation failures do **not** abort metric submission — they are informational fields that the dashboard can surface to the user.
+
+---
+
 ## `BackendApiClient`
 
 Thin HTTP client. `X-Agent-ApiKey` is added to `DefaultRequestHeaders` at construction. All methods swallow non-cancellation exceptions and return `null`/`false` on failure — the agent's job loop treats these as transient failures and continues.
@@ -323,3 +346,5 @@ The agent sends its version (`Assembly.GetExecutingAssembly().GetName().Version`
 - **The `[optimizer]` schema** is created in the customer database if absent. Used as a sandbox for running the optimized version. Always cleaned up in `finally`.
 - **Server/database names** are masked before being sent to the backend: first char + last 3 chars, rest replaced with `*`. A SHA-256 hash of `serverName|databaseName` (lowercased) is also sent for identity matching without revealing the full names.
 - **`SubmitObjectMetricsAsync`** in `AgentWorker.cs` is dead code — it is never called. The active path is `SubmitOptimizedMetricsAsync`.
+- **Result set validation** (`ResultSetHasher`, `ExecutionValidation`) runs after both original and optimized execute. Failures are non-fatal — they populate informational DTO fields only.
+- **NuGet package** consumed is `SqlBrain.Contracts` (the published name), not `DbOptimizer.Contracts` (the project name in the backend repo). Keep these in sync when the Contracts project version bumps.
