@@ -105,9 +105,32 @@ public class AgentWorker : BackgroundService
                 _logger.LogInformation("Submitting metrics for {Count} ready object(s) from running job(s)",
                     poll.ReadyToExecuteObjects.Count);
 
-                foreach (var obj in poll.ReadyToExecuteObjects)
+                // Group by job so we can drop each job's staging schema after all its objects complete.
+                var objectsByJob = poll.ReadyToExecuteObjects
+                    .GroupBy(o => o.JobId)
+                    .ToList();
+
+                foreach (var jobGroup in objectsByJob)
                 {
-                    await SubmitOptimizedMetricsAsync(obj.JobId, obj, stoppingToken);
+                    var stagingSchema = jobGroup.First().StagingSchema;
+                    try
+                    {
+                        foreach (var obj in jobGroup)
+                            await SubmitOptimizedMetricsAsync(obj.JobId, obj, stoppingToken);
+                    }
+                    finally
+                    {
+                        if (!string.IsNullOrEmpty(stagingSchema))
+                        {
+                            try { await _executor.DropStagingSchemaAsync(stagingSchema, stoppingToken); }
+                            catch (Exception ex)
+                            {
+                                _logger.LogWarning(ex,
+                                    "Job {JobId}: failed to drop staging schema [{StagingSchema}] — may require manual cleanup",
+                                    jobGroup.Key, stagingSchema);
+                            }
+                        }
+                    }
                 }
             }
             else
@@ -129,10 +152,12 @@ public class AgentWorker : BackgroundService
 
         try
         {
-            var definitions = await _crawler.CrawlObjectsAsync(stoppingToken);
-            _logger.LogInformation("Discovery: crawled {Count} objects", definitions.Count);
+            var definitions  = await _crawler.CrawlObjectsAsync(stoppingToken);
+            var schemaNames  = await _crawler.GetSchemaNames(stoppingToken);
+            _logger.LogInformation("Discovery: crawled {Count} objects, {SchemaCount} schemas",
+                definitions.Count, schemaNames.Count);
 
-            var sessionId = await _api.PostDiscoveryAsync(jobId, definitions, stoppingToken);
+            var sessionId = await _api.PostDiscoveryAsync(jobId, definitions, schemaNames, stoppingToken);
             if (sessionId is null)
             {
                 _logger.LogError("Discovery: failed to post objects to backend — will retry next cycle");
@@ -200,9 +225,25 @@ public class AgentWorker : BackgroundService
                 job.Id, results.Count);
 
             // Phase 3: Execute optimized versions only (originals already captured in baseline).
-            foreach (var obj in results)
+            // The finally block drops the entire staging schema as a catch-all in case any
+            // per-object cleanup was missed during benchmarking.
+            try
             {
-                await SubmitOptimizedMetricsAsync(job.Id, obj, stoppingToken);
+                foreach (var obj in results)
+                    await SubmitOptimizedMetricsAsync(job.Id, obj, stoppingToken);
+            }
+            finally
+            {
+                if (!string.IsNullOrEmpty(job.StagingSchema))
+                {
+                    try { await _executor.DropStagingSchemaAsync(job.StagingSchema, stoppingToken); }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "Job {JobId}: failed to drop staging schema [{StagingSchema}] — may require manual cleanup",
+                            job.Id, job.StagingSchema);
+                    }
+                }
             }
 
             _logger.LogInformation("Job {JobId}: completed", job.Id);
@@ -317,6 +358,7 @@ public class AgentWorker : BackgroundService
             "Job {JobId}: benchmarking optimized [{Schema}].[{Object}]",
             jobId, obj.SchemaName, obj.ObjectName);
 
+        var stagingSchema    = obj.StagingSchema;
         var hasRealParamSets = obj.ParameterSets?.Count > 0;
         var paramSetsToRun   = hasRealParamSets
             ? obj.ParameterSets!
@@ -328,16 +370,53 @@ public class AgentWorker : BackgroundService
         var optimizedDeployed = false;
         if (!string.IsNullOrWhiteSpace(obj.OptimizedDefinition))
         {
-            try
+            if (string.IsNullOrEmpty(stagingSchema))
             {
-                await _executor.DeployUnderOptimizerSchemaAsync(obj, obj.OptimizedDefinition, stoppingToken);
-                optimizedDeployed = true;
+                _logger.LogWarning(
+                    "Job {JobId}: [{Schema}].[{Object}] has no staging schema — optimized benchmark skipped",
+                    jobId, obj.SchemaName, obj.ObjectName);
             }
-            catch (Exception ex)
+            else
             {
-                _logger.LogError(ex,
-                    "Job {JobId}: failed to deploy [optimizer].[{Object}] — optimized benchmarks will be skipped",
-                    jobId, obj.ObjectName);
+                // Per-object collision check: if [stagingSchema].[ObjectName] already exists on the
+                // customer database, the schema was somehow not clean at discovery time. Mark the
+                // object Failed without a credit refund (Claude already ran) and skip execution.
+                var collisionDetected = false;
+                try
+                {
+                    collisionDetected = await _executor.StagingObjectExistsAsync(stagingSchema, obj.ObjectName, stoppingToken);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _logger.LogWarning(ex,
+                        "Job {JobId}: staging collision check failed for [{Schema}].[{Object}] — proceeding with deployment",
+                        jobId, stagingSchema, obj.ObjectName);
+                }
+
+                if (collisionDetected)
+                {
+                    _logger.LogError(
+                        "Job {JobId}: [{StagingSchema}].[{Object}] already exists — " +
+                        "staging object collision detected at deploy time (no credit refund)",
+                        jobId, stagingSchema, obj.ObjectName);
+                    await _api.ReportExecutionFailedAsync(jobId, obj.Id,
+                        "Staging object collision detected — schema was validated clean at discovery time",
+                        stoppingToken,
+                        skipRefund: true);
+                    return;
+                }
+
+                try
+                {
+                    await _executor.DeployUnderOptimizerSchemaAsync(obj, obj.OptimizedDefinition, stagingSchema, stoppingToken);
+                    optimizedDeployed = true;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "Job {JobId}: failed to deploy [{StagingSchema}].[{Object}] — optimized benchmarks will be skipped",
+                        jobId, stagingSchema, obj.ObjectName);
+                }
             }
         }
 
@@ -407,7 +486,7 @@ public class AgentWorker : BackgroundService
                         var optimizerObj = new JobObjectDto
                         {
                             Id           = obj.Id,
-                            SchemaName   = "optimizer",
+                            SchemaName   = stagingSchema,
                             ObjectName   = obj.ObjectName,
                             ObjectTypeId = obj.ObjectTypeId,
                         };
@@ -494,12 +573,12 @@ public class AgentWorker : BackgroundService
         {
             if (optimizedDeployed)
             {
-                try { await _executor.RemoveFromOptimizerSchemaAsync(obj, stoppingToken); }
+                try { await _executor.RemoveFromOptimizerSchemaAsync(obj, stagingSchema, stoppingToken); }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex,
-                        "Job {JobId}: cleanup of [optimizer].[{Object}] failed",
-                        jobId, obj.ObjectName);
+                        "Job {JobId}: cleanup of [{StagingSchema}].[{Object}] failed",
+                        jobId, stagingSchema, obj.ObjectName);
                 }
             }
         }
@@ -587,7 +666,7 @@ public class AgentWorker : BackgroundService
                 var deployed = false;
                 try
                 {
-                    await _executor.DeployUnderOptimizerSchemaAsync(obj, obj.OptimizedDefinition, stoppingToken);
+                    await _executor.DeployUnderOptimizerSchemaAsync(obj, obj.OptimizedDefinition, obj.StagingSchema, stoppingToken);
                     deployed = true;
                 }
                 catch (Exception ex)
@@ -636,13 +715,13 @@ public class AgentWorker : BackgroundService
                         // Optimizer schema cleanup always runs, even if optimized execution failed.
                         try
                         {
-                            await _executor.RemoveFromOptimizerSchemaAsync(obj, stoppingToken);
+                            await _executor.RemoveFromOptimizerSchemaAsync(obj, obj.StagingSchema, stoppingToken);
                         }
                         catch (Exception cleanupEx)
                         {
                             _logger.LogWarning(cleanupEx,
-                                "Job {JobId}: cleanup of [optimizer].[{Object}] failed — may require manual removal",
-                                jobId, obj.ObjectName);
+                                "Job {JobId}: cleanup of [{StagingSchema}].[{Object}] failed — may require manual removal",
+                                jobId, obj.StagingSchema, obj.ObjectName);
                         }
                     }
                 }

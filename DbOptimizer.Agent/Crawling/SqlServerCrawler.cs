@@ -141,6 +141,39 @@ public class SqlServerCrawler
     }
 
     /// <summary>
+    /// Returns all schema names that currently exist on the customer SQL Server.
+    /// Sent to the backend at discovery time so it can verify the pre-generated StagingSchema
+    /// does not collide with an existing schema.
+    /// </summary>
+    public async Task<List<string>> GetSchemaNames(CancellationToken cancellationToken = default)
+    {
+        const string sql = "SELECT name FROM sys.schemas";
+
+        var result = new List<string>();
+
+        try
+        {
+            await using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync(cancellationToken);
+
+            await using var command = new SqlCommand(sql, connection);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+            while (await reader.ReadAsync(cancellationToken))
+                result.Add(reader.GetString(0));
+
+            _logger.LogDebug("Retrieved {Count} schema names for staging schema collision check", result.Count);
+        }
+        catch (SqlException ex)
+        {
+            _logger.LogWarning(ex,
+                "Could not query sys.schemas — staging schema collision check will be skipped");
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// Returns server name, database name, SQL Server version string, and compatibility level.
     /// </summary>
     public async Task<ServerInfo> GetServerInfoAsync(CancellationToken cancellationToken = default)

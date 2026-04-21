@@ -50,13 +50,23 @@ public class BackendApiClient
 
     /// <summary>
     /// Posts discovered objects to the backend to create a DiscoverySession.
+    /// Also sends existing schema names so the backend can verify the staging schema does not collide.
     /// Returns the new session ID, or null on failure.
     /// </summary>
-    public async Task<int?> PostDiscoveryAsync(int jobId, List<DiscoveredObjectDto> objects, CancellationToken cancellationToken)
+    public async Task<int?> PostDiscoveryAsync(
+        int jobId,
+        List<DiscoveredObjectDto> objects,
+        List<string> existingSchemaNames,
+        CancellationToken cancellationToken)
     {
         try
         {
-            var request = new PostAgentDiscoveryRequest { JobId = jobId, Objects = objects };
+            var request = new PostAgentDiscoveryRequest
+            {
+                JobId = jobId,
+                Objects = objects,
+                ExistingSchemaNames = existingSchemaNames
+            };
             var response = await _httpClient.PostAsJsonAsync("api/agent/discovery", request, cancellationToken);
             response.EnsureSuccessStatusCode();
             var result = await response.Content.ReadFromJsonAsync<AgentDiscoveryResponse>(cancellationToken: cancellationToken);
@@ -177,15 +187,21 @@ public class BackendApiClient
 
     /// <summary>
     /// Reports that execution of a specific job object failed.
-    /// The backend marks the object Failed and issues a credit refund if applicable.
+    /// The backend marks the object Failed. Pass skipRefund=true for staging collision failures
+    /// where the Claude API was already called and credits should not be returned.
     /// </summary>
-    public async Task<bool> ReportExecutionFailedAsync(int jobId, int objectId, string reason, CancellationToken cancellationToken)
+    public async Task<bool> ReportExecutionFailedAsync(
+        int jobId,
+        int objectId,
+        string reason,
+        CancellationToken cancellationToken,
+        bool skipRefund = false)
     {
         try
         {
             var response = await _httpClient.PostAsJsonAsync(
                 $"api/agent/jobs/{jobId}/objects/{objectId}/execution-failed",
-                new { reason },
+                new { reason, skipRefund },
                 cancellationToken);
             response.EnsureSuccessStatusCode();
             return true;

@@ -239,20 +239,22 @@ public class SqlObjectExecutor
     }
 
     /// <summary>
-    /// Creates the [optimizer] schema if absent, rewrites the object header to target
-    /// [optimizer].[objectName], then executes as CREATE OR ALTER.
+    /// Creates the staging schema if absent, rewrites the object header to target
+    /// [stagingSchema].[objectName], then executes as CREATE OR ALTER.
     /// </summary>
     public async Task DeployUnderOptimizerSchemaAsync(
         JobObjectDto jobObject,
         string optimizedDefinition,
+        string stagingSchema,
         CancellationToken cancellationToken = default)
     {
-        const string ensureSchemaSql = """
-            IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'optimizer')
-                EXEC('CREATE SCHEMA [optimizer]');
+        var escapedSchema = EscapeIdentifier(stagingSchema);
+        var ensureSchemaSql = $"""
+            IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = {EscapeStringLiteral(stagingSchema)})
+                EXEC('CREATE SCHEMA {escapedSchema}');
             """;
 
-        var rewrittenDefinition = RewriteObjectHeader(jobObject, optimizedDefinition);
+        var rewrittenDefinition = RewriteObjectHeader(jobObject, optimizedDefinition, stagingSchema);
 
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
@@ -269,18 +271,19 @@ public class SqlObjectExecutor
         await deployCmd.ExecuteNonQueryAsync(cancellationToken);
 
         _logger.LogInformation(
-            "Deployed [optimizer].[{ObjectName}] (TypeId={ObjectTypeId})",
-            jobObject.ObjectName, jobObject.ObjectTypeId);
+            "Deployed [{StagingSchema}].[{ObjectName}] (TypeId={ObjectTypeId})",
+            stagingSchema, jobObject.ObjectName, jobObject.ObjectTypeId);
     }
 
     /// <summary>
-    /// Drops the object from the [optimizer] schema via DROP [TYPE] IF EXISTS.
+    /// Drops the object from the staging schema via DROP [TYPE] IF EXISTS.
     /// </summary>
     public async Task RemoveFromOptimizerSchemaAsync(
         JobObjectDto jobObject,
+        string stagingSchema,
         CancellationToken cancellationToken = default)
     {
-        var dropSql = BuildDropSql(jobObject);
+        var dropSql = BuildDropSql(jobObject, stagingSchema);
 
         await using var connection = new SqlConnection(_connectionString);
         await connection.OpenAsync(cancellationToken);
@@ -292,8 +295,56 @@ public class SqlObjectExecutor
         await dropCmd.ExecuteNonQueryAsync(cancellationToken);
 
         _logger.LogInformation(
-            "Dropped [optimizer].[{ObjectName}] from optimizer schema",
-            jobObject.ObjectName);
+            "Dropped [{StagingSchema}].[{ObjectName}] from staging schema",
+            stagingSchema, jobObject.ObjectName);
+    }
+
+    /// <summary>
+    /// Returns true if [stagingSchema].[objectName] already exists in the customer database.
+    /// Used as a pre-deployment guard to detect collisions at benchmark time.
+    /// </summary>
+    public async Task<bool> StagingObjectExistsAsync(
+        string stagingSchema,
+        string objectName,
+        CancellationToken cancellationToken = default)
+    {
+        const string sql = """
+            SELECT COUNT(1)
+            FROM sys.objects o
+            INNER JOIN sys.schemas s ON s.schema_id = o.schema_id
+            WHERE s.name = @schema AND o.name = @name
+            """;
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var cmd = new SqlCommand(sql, connection) { CommandTimeout = 30 };
+        cmd.Parameters.AddWithValue("@schema", stagingSchema);
+        cmd.Parameters.AddWithValue("@name", objectName);
+
+        var count = (int)(await cmd.ExecuteScalarAsync(cancellationToken))!;
+        return count > 0;
+    }
+
+    /// <summary>
+    /// Drops the entire staging schema as a catch-all cleanup after all objects for a job
+    /// have been benchmarked. Only succeeds when the schema is empty (per-object cleanup
+    /// should have removed all objects already).
+    /// </summary>
+    public async Task DropStagingSchemaAsync(
+        string stagingSchema,
+        CancellationToken cancellationToken = default)
+    {
+        var escapedSchema = EscapeIdentifier(stagingSchema);
+        var dropSchemaSql = $"DROP SCHEMA IF EXISTS {escapedSchema}";
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        await using var cmd = new SqlCommand(dropSchemaSql, connection) { CommandTimeout = 30 };
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+
+        _logger.LogInformation("Dropped staging schema [{StagingSchema}]", stagingSchema);
     }
 
     // -------------------------------------------------------------------------
@@ -553,30 +604,36 @@ public class SqlObjectExecutor
     // Rewrite / drop helpers
     // -------------------------------------------------------------------------
 
-    private static string RewriteObjectHeader(JobObjectDto jobObject, string definition)
+    private static string RewriteObjectHeader(JobObjectDto jobObject, string definition, string stagingSchema)
     {
-        var keyword    = GetObjectKeyword(jobObject.ObjectTypeId);
-        var objectName = EscapeIdentifier(jobObject.ObjectName);
+        var keyword      = GetObjectKeyword(jobObject.ObjectTypeId);
+        var objectName   = EscapeIdentifier(jobObject.ObjectName);
+        var schemaName   = EscapeIdentifier(stagingSchema);
 
         if (!ObjectHeaderRegex.IsMatch(definition))
             throw new InvalidOperationException(
                 $"Could not locate a CREATE/ALTER {keyword} header in the definition of {objectName}. " +
-                "Unable to rewrite the header for deployment to the [optimizer] schema.");
+                $"Unable to rewrite the header for deployment to the {schemaName} schema.");
 
         // Replace the first CREATE/ALTER ... PROCEDURE/FUNCTION/VIEW [schema].[name]
-        // with CREATE OR ALTER KEYWORD [optimizer].[name].
+        // with CREATE OR ALTER KEYWORD [stagingSchema].[name].
         return ObjectHeaderRegex.Replace(
             definition,
-            _ => $"CREATE OR ALTER {keyword} [optimizer].{objectName}",
+            _ => $"CREATE OR ALTER {keyword} {schemaName}.{objectName}",
             count: 1);
     }
 
-    private static string BuildDropSql(JobObjectDto jobObject)
+    private static string BuildDropSql(JobObjectDto jobObject, string stagingSchema)
     {
         var objectName = EscapeIdentifier(jobObject.ObjectName);
-        var dropType = GetObjectKeyword(jobObject.ObjectTypeId);
-        return $"DROP {dropType} IF EXISTS [optimizer].{objectName}";
+        var schemaName = EscapeIdentifier(stagingSchema);
+        var dropType   = GetObjectKeyword(jobObject.ObjectTypeId);
+        return $"DROP {dropType} IF EXISTS {schemaName}.{objectName}";
     }
+
+    /// <summary>Escapes a value for use as a T-SQL string literal (single-quote escaping).</summary>
+    private static string EscapeStringLiteral(string value) => $"N'{value.Replace("'", "''")}'";
+
 
     private static string GetObjectKeyword(int objectTypeId) => objectTypeId switch
     {
