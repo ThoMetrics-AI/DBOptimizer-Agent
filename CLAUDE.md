@@ -26,9 +26,9 @@ This is the on-premise component of DbOptimizer. It runs inside the customer's f
 - When no job is pending and no active discovery session exists: crawl the customer's SQL Server and post discovered objects to the backend (`RunDiscovery`)
 - When a job arrives: start the job, fetch its objects and parameter sets, capture estimated execution plans, post them for Claude optimization
 - Poll for Claude's optimized results
-- Deploy each optimized object temporarily under an `[optimizer]` schema
+- Deploy each optimized object temporarily under a per-job staging schema (`dbopt_XXXXXX`)
 - Execute both the original and optimized versions with each parameter set under `SET STATISTICS IO/TIME/XML ON` to capture real execution metrics
-- Clean up the `[optimizer]` schema copy
+- Clean up the staging schema after all objects in the job complete
 - Post execution metrics back to the backend
 
 **Data that leaves the customer network:** Only T-SQL object definitions (code), execution plan XML (structure), and numeric metrics (row counts, execution time, logical reads, CPU time). No row data, no PII. AI-generated parameter sets contain SQL sampling queries, not actual data values — those queries are resolved against the live database locally.
@@ -43,8 +43,8 @@ dboptimizer-agent/
     Configuration/
       AgentConfiguration.cs     — Typed config: AgentId, BackendUrl, ApiKey, SqlConnectionString, poll intervals, ChecksumRowThreshold, FloatEpsilon
     Crawling/
-      SqlServerCrawler.cs       — Crawls sys.objects/sys.sql_modules, queries DMVs for frequencies
-      SqlObjectExecutor.cs      — Deploys to [optimizer] schema, executes, captures metrics, resolves $query params
+      SqlServerCrawler.cs       — Crawls sys.objects/sys.sql_modules, queries DMVs for frequencies; GetSchemaNames() queries sys.schemas
+      SqlObjectExecutor.cs      — Deploys to staging schema, executes, captures metrics, resolves $query params
       ResultSetHasher.cs        — Checksum computation for result sets; supports sampled hashing for large sets
       ExecutionValidation.cs    — Row count and column schema comparison between original and optimized executions
     Http/
@@ -60,7 +60,7 @@ dboptimizer-agent/
 
 ### External dependencies
 
-- **`SqlBrain.Contracts`** — NuGet package published from the backend's `DbOptimizer.Contracts` project. Provides all shared DTOs (`JobDto`, `JobObjectDto`, `ParameterSetDto`, `DiscoveredObjectDto`, `ExecutionResultDto`, `BaselineObjectResult`), request types, and `AgentPollResponse`. This is the only cross-repo dependency.
+- **`SqlBrain.Contracts`** — NuGet package published from the backend's `DbOptimizer.Contracts` project. Provides all shared DTOs (`JobDto`, `JobObjectDto`, `ParameterSetDto`, `DiscoveredObjectDto`, `ExecutionResultDto`, `BaselineObjectResult`), request types, and `AgentPollResponse`. This is the only cross-repo dependency. **Bump the version in `DbOptimizer.Agent.csproj` whenever any file in `DbOptimizer.Contracts` changes.**
 - **`Microsoft.Data.SqlClient`** — Direct ADO.NET for all SQL Server access. No ORM.
 - No reference to `DbOptimizer.Core`, `DbOptimizer.Claude`, or `DbOptimizer.Infrastructure`.
 
@@ -105,7 +105,7 @@ The top-level poll loop. Runs continuously until cancelled.
 6. Check `poll.UpdateAvailable` — if true, log a warning and continue.
 7. If `poll.RunDiscovery` → `RunDiscoveryAsync` (crawl and post to backend), then `continue`.
 8. If `poll.PendingJobs.Count > 0` → `ProcessJobAsync(poll.PendingJobs[0])`.
-9. Else if `poll.ReadyToExecuteObjects.Count > 0` → `SubmitOptimizedMetricsAsync` for each (handles objects picked up via BenchmarkingComplete poll path).
+9. Else if `poll.ReadyToExecuteObjects.Count > 0` → group objects by `JobId`, then `SubmitOptimizedMetricsAsync` for each, with a job-level `finally` that drops the staging schema.
 10. Else → sleep and loop.
 
 ### `RunDiscoveryAsync`
@@ -113,9 +113,10 @@ The top-level poll loop. Runs continuously until cancelled.
 Called when `poll.RunDiscovery == true` (backend has no active discovery session for this agent).
 
 1. `SqlServerCrawler.CrawlObjectsAsync` → `List<DiscoveredObjectDto>`
-2. `BackendApiClient.PostDiscoveryAsync` → `POST /api/agent/discovery`
-3. Backend creates a `DiscoverySession`, fires `DiscoverySessionCreated` SignalR event to navigate the dashboard.
-4. User selects objects in the dashboard to create a job — agent does NOT participate further in discovery.
+2. `SqlServerCrawler.GetSchemaNames()` → `List<string>` — all existing schema names on the customer database (used for staging schema collision detection at the backend).
+3. `BackendApiClient.PostDiscoveryAsync(jobId, objects, schemaNames)` → `POST /api/agent/discovery`
+4. Backend creates a `DiscoverySession`, performs staging schema collision check, fires `DiscoverySessionCreated` SignalR event to navigate the dashboard.
+5. User selects objects in the dashboard — agent does NOT participate further in discovery.
 
 ### `ProcessJobAsync`
 
@@ -123,7 +124,7 @@ Three sequential phases for each job:
 
 **Phase 1 — Baseline execution plans**
 1. `BackendApiClient.StartJobAsync` → `POST /api/agent/jobs/{jobId}/start` — transitions job `Pending → Running`.
-2. `BackendApiClient.GetJobObjectsAsync` → `GET /api/agent/jobs/{jobId}/objects` — returns all non-skipped objects with their parameter sets.
+2. `BackendApiClient.GetJobObjectsAsync` → `GET /api/agent/jobs/{jobId}/objects` — returns all non-skipped objects with their parameter sets. Each `JobObjectDto` includes `StagingSchema`.
 3. `RunBaselineExecutionsAsync` — for each object, calls `SqlObjectExecutor.GetEstimatedPlanAsync` (uses `SET SHOWPLAN_XML ON` — no actual execution, no parameters needed).
 4. Successful plan captures are batched and posted via `BackendApiClient.SubmitBaselinesAsync` → `POST /api/agent/jobs/{jobId}/baselines`.
 5. Objects that fail plan capture are reported via `BackendApiClient.ReportExecutionFailedAsync`.
@@ -135,24 +136,46 @@ Three sequential phases for each job:
 - Returns the list once objects with optimized definitions are ready.
 
 **Phase 3 — Benchmark optimized versions**
-For each `JobObjectDto` in the results: `SubmitOptimizedMetricsAsync`.
+Wrapped in a `try/finally`. For each `JobObjectDto` in the results: `SubmitOptimizedMetricsAsync`. After all objects complete (success or failure), the `finally` block calls `DropStagingSchemaAsync` to clean up the entire staging schema.
 
 ### `SubmitOptimizedMetricsAsync`
 
 Executes both original and optimized versions for every parameter set and posts all results together.
 
-1. Determine parameter sets to use — `obj.ParameterSets` if present, otherwise a synthetic empty set.
-2. Deploy optimized version once: `SqlObjectExecutor.DeployUnderOptimizerSchemaAsync` (reused for all param sets).
-3. For each parameter set:
+1. Read `stagingSchema = obj.StagingSchema`. If empty → log warning and skip (object came from a code path with no staging schema; should not happen).
+2. **Per-object pre-deploy collision check:** `SqlObjectExecutor.StagingObjectExistsAsync(stagingSchema, objectName)`. If the object already exists under the staging schema → call `ReportExecutionFailedAsync` with `skipRefund: true` (Claude already ran, credits are not refunded) → return early.
+3. Determine parameter sets to use — `obj.ParameterSets` if present, otherwise a synthetic empty set.
+4. Deploy optimized version once: `SqlObjectExecutor.DeployUnderOptimizerSchemaAsync(stagingSchema, ...)` (reused for all param sets).
+5. For each parameter set:
    - **Original execution:** `SqlObjectExecutor.ExecuteAndCaptureAsync(obj, parametersJson)` → `ExecutionResultDto` with `ExecutionVersionId = 1`.
    - If original fails → `continue` to next param set (optimized skipped for this set).
-   - **Optimized execution:** `SqlObjectExecutor.ExecuteAndCaptureAsync(optimizerObj with SchemaName="optimizer", parametersJson)` → `ExecutionResultDto` with `ExecutionVersionId = 2`. Non-fatal — if optimized fails, original metrics are still posted.
-4. Cleanup: `SqlObjectExecutor.RemoveFromOptimizerSchemaAsync` in `finally`.
-5. If `results.Count == 0` → call `ReportExecutionFailedAsync` (triggers credit refund).
-6. `BackendApiClient.SubmitMetricsAsync` → `POST /api/agent/jobs/{jobId}/metrics`.
-7. If submit fails → call `ReportExecutionFailedAsync`.
+   - **Optimized execution:** `SqlObjectExecutor.ExecuteAndCaptureAsync(optimizerObj with SchemaName=stagingSchema, parametersJson)` → `ExecutionResultDto` with `ExecutionVersionId = 2`. Non-fatal — if optimized fails, original metrics are still posted.
+6. Cleanup: `SqlObjectExecutor.RemoveFromOptimizerSchemaAsync(stagingSchema, ...)` in `finally`.
+7. If `results.Count == 0` → call `ReportExecutionFailedAsync` (triggers credit refund).
+8. `BackendApiClient.SubmitMetricsAsync` → `POST /api/agent/jobs/{jobId}/metrics`.
+9. If submit fails → call `ReportExecutionFailedAsync`.
 
 > **`SubmitObjectMetricsAsync`** (single-param-set version) still exists in `AgentWorker.cs` but is **dead code** — it is not called anywhere. The current path always goes through `SubmitOptimizedMetricsAsync`.
+
+---
+
+## Staging Schema
+
+Each job gets a unique staging schema name (`dbopt_XXXXXX` where XXXXXX is 6 lowercase hex chars) provided by the backend on every `JobDto` and `JobObjectDto`. The agent **never generates or hardcodes** the schema name — it always comes from the backend.
+
+**Lifecycle:**
+1. Backend generates the name at job creation and checks for collision at discovery time.
+2. Agent reads it from `obj.StagingSchema` on every `JobObjectDto`.
+3. Before deploying, agent calls `StagingObjectExistsAsync` to check if the object already exists under that schema — fails with `skipRefund: true` if it does.
+4. After all objects in a job complete (in `finally`), agent calls `DropStagingSchemaAsync` to drop the entire schema.
+
+**`SqlObjectExecutor` methods that take `stagingSchema`:**
+- `DeployUnderOptimizerSchemaAsync(stagingSchema, ...)` — creates schema if absent, rewrites DDL header, executes.
+- `RemoveFromOptimizerSchemaAsync(stagingSchema, ...)` — drops the individual object (called per-object in `finally`).
+- `StagingObjectExistsAsync(stagingSchema, objectName, ct)` — queries `sys.objects JOIN sys.schemas`.
+- `DropStagingSchemaAsync(stagingSchema, ct)` — executes `DROP SCHEMA IF EXISTS [escapedSchema]` (called job-level in `finally`).
+
+Both `EscapeIdentifier` and `EscapeStringLiteral` helpers are used to safely build the SQL for these operations.
 
 ---
 
@@ -185,6 +208,9 @@ Connects to the customer SQL Server and returns all crawlable objects.
 2. `GetProcedureFrequenciesAsync` — queries `sys.dm_exec_procedure_stats` for estimated executions per day (`SUM(execution_count) / DATEDIFF(DAY, cached_time, GETDATE())`). Only covers stored procedures. Silently swallows `SqlException` (e.g. `VIEW SERVER STATE` permission missing on SQL Express).
 3. Main query: `sys.objects JOIN sys.sql_modules JOIN sys.schemas` for types `P, V, FN, IF, TF`, excluding `is_ms_shipped = 1` objects.
 4. For each object: maps `sys.objects.type` code to `ObjectTypeId` (inlined constants — Core not referenced), looks up frequency, runs `ExtractHints`, crawls parameter metadata via `sys.parameters` for stored procedures, builds a `DiscoveredObjectDto`.
+
+**`GetSchemaNames()`:**
+Queries `SELECT name FROM sys.schemas` and returns all schema names. Called during `RunDiscoveryAsync` and passed to the backend as `ExistingSchemaNames` in `PostAgentDiscoveryRequest` so the backend can check the generated staging schema name for collisions. Swallows `SqlException` with a warning log and returns an empty list on failure.
 
 **Object type codes → ObjectTypeId:**
 | sys.objects.type | ObjectTypeId |
@@ -227,15 +253,23 @@ Resolves `$query` parameters first via `ResolveParametersAsync`, then runs `SET 
 | ScalarFunction | `SELECT [schema].[name](@p0, @p1, ...)` |
 | InlineTVF / MultiStatementTVF | `SELECT * FROM [schema].[name](@p0, @p1, ...)` |
 
-### `DeployUnderOptimizerSchemaAsync`
+### `DeployUnderOptimizerSchemaAsync(stagingSchema, ...)`
 
-1. Ensures the `[optimizer]` schema exists (`IF NOT EXISTS ... EXEC('CREATE SCHEMA [optimizer]')`).
-2. `RewriteObjectHeader` — replaces the first `CREATE [OR ALTER] PROCEDURE/FUNCTION/VIEW [schema].[name]` with `CREATE OR ALTER {KEYWORD} [optimizer].[name]` using a compiled regex.
+1. Ensures the staging schema exists (`IF NOT EXISTS ... EXEC('CREATE SCHEMA [escapedSchema]')`).
+2. `RewriteObjectHeader(stagingSchema, ...)` — replaces the first `CREATE [OR ALTER] PROCEDURE/FUNCTION/VIEW [schema].[name]` with `CREATE OR ALTER {KEYWORD} [stagingSchema].[name]` using a compiled regex.
 3. Executes the rewritten DDL.
 
-### `RemoveFromOptimizerSchemaAsync`
+### `RemoveFromOptimizerSchemaAsync(stagingSchema, ...)`
 
-Runs `DROP {PROCEDURE|VIEW|FUNCTION} IF EXISTS [optimizer].[name]`. Always called in `finally` after optimized execution.
+Runs `DROP {PROCEDURE|VIEW|FUNCTION} IF EXISTS [stagingSchema].[name]`. Always called in `finally` after optimized execution (per-object cleanup).
+
+### `StagingObjectExistsAsync(stagingSchema, objectName, ct)`
+
+Queries `sys.objects JOIN sys.schemas` with parameterized SQL to check if an object with the given name already exists under the staging schema. Called before deployment as a pre-flight collision check.
+
+### `DropStagingSchemaAsync(stagingSchema, ct)`
+
+Executes `DROP SCHEMA IF EXISTS [escapedSchema]`. Called in the job-level `finally` block after all objects in a job have been processed (regardless of success or failure). Cleans up the entire staging schema at once.
 
 ---
 
@@ -262,17 +296,17 @@ Validation failures do **not** abort metric submission — they are informationa
 
 Thin HTTP client. `X-Agent-ApiKey` is added to `DefaultRequestHeaders` at construction. All methods swallow non-cancellation exceptions and return `null`/`false` on failure — the agent's job loop treats these as transient failures and continues.
 
-| Method | Endpoint | Returns null/false when |
-|--------|----------|------------------------|
-| `PollForJobAsync` | `POST /api/agent/poll` | Any exception, or `204 NoContent` |
-| `PostDiscoveryAsync` | `POST /api/agent/discovery` | Any exception |
-| `StartJobAsync` | `POST /api/agent/jobs/{id}/start` | Any exception |
-| `GetJobObjectsAsync` | `GET /api/agent/jobs/{id}/objects` | Any exception |
-| `SubmitBaselinesAsync` | `POST /api/agent/jobs/{id}/baselines` | Any exception |
-| `PollForResultsAsync` | `GET /api/agent/jobs/{id}/results` | Any exception, `204 NoContent`, or `200 []` |
-| `SubmitMetricsAsync` | `POST /api/agent/jobs/{id}/metrics` | Any exception |
-| `ReportExecutionFailedAsync` | `POST /api/agent/jobs/{id}/objects/{oid}/execution-failed` | Any exception |
-| `SendHeartbeatAsync` | `POST /api/agent/heartbeat` | Any exception |
+| Method | Endpoint | Notes |
+|--------|----------|-------|
+| `PollForJobAsync` | `POST /api/agent/poll` | Returns null on exception or `204 NoContent` |
+| `PostDiscoveryAsync(jobId, objects, existingSchemaNames)` | `POST /api/agent/discovery` | Sends schema names for collision check |
+| `StartJobAsync` | `POST /api/agent/jobs/{id}/start` | Returns false on exception |
+| `GetJobObjectsAsync` | `GET /api/agent/jobs/{id}/objects` | Returns null on exception |
+| `SubmitBaselinesAsync` | `POST /api/agent/jobs/{id}/baselines` | Returns false on exception |
+| `PollForResultsAsync` | `GET /api/agent/jobs/{id}/results` | Returns null on exception, `204 NoContent`, or `200 []` |
+| `SubmitMetricsAsync` | `POST /api/agent/jobs/{id}/metrics` | Returns false on exception |
+| `ReportExecutionFailedAsync(jobId, objectId, reason, ct, skipRefund)` | `POST /api/agent/jobs/{id}/objects/{oid}/execution-failed` | `skipRefund: true` for staging collision (Claude ran, credits not returned) |
+| `SendHeartbeatAsync` | `POST /api/agent/heartbeat` | Returns false on exception |
 
 ---
 
@@ -283,12 +317,12 @@ Thin HTTP client. `X-Agent-ApiKey` is added to `DefaultRequestHeaders` at constr
   ↓ poll interval
 POST /api/agent/poll  (body: AgentPollRequest with version + masked server metadata)
   ├─ MustUpdate=true       →  stop service
-  ├─ RunDiscovery=true     →  CrawlObjectsAsync → POST /api/agent/discovery → continue
+  ├─ RunDiscovery=true     →  GetSchemaNames → CrawlObjectsAsync → POST /api/agent/discovery → continue
   ├─ PendingJobs[0] = job J  →  ProcessJobAsync(J)
   │     ↓
   │   POST /api/agent/jobs/J/start
   │     ↓
-  │   GET /api/agent/jobs/J/objects  (returns objects + parameter sets)
+  │   GET /api/agent/jobs/J/objects  (returns objects + parameter sets + StagingSchema)
   │     ↓
   │   Phase 1: RunBaselineExecutionsAsync
   │     for each object: GetEstimatedPlanAsync (SET SHOWPLAN_XML ON — no actual execution)
@@ -301,19 +335,23 @@ POST /api/agent/poll  (body: AgentPollRequest with version + masked server metad
   │     → 204 or 200+[] → keep polling
   │     → 200+objects   → proceed to Phase 3
   │     ↓
-  │   Phase 3: SubmitOptimizedMetricsAsync for each optimized object
-  │     DeployUnderOptimizerSchemaAsync (once per object)
+  │   Phase 3: SubmitOptimizedMetricsAsync for each optimized object  [try]
+  │     StagingObjectExistsAsync → if exists: ReportExecutionFailed(skipRefund:true), skip
+  │     DeployUnderOptimizerSchemaAsync(stagingSchema)
   │     for each ParameterSet:
   │       ExecuteAndCaptureAsync(original)  → ExecutionVersionId=1
-  │       ExecuteAndCaptureAsync([optimizer].[name])  → ExecutionVersionId=2
-  │     RemoveFromOptimizerSchemaAsync
+  │       ExecuteAndCaptureAsync([stagingSchema].[name])  → ExecutionVersionId=2
+  │     RemoveFromOptimizerSchemaAsync(stagingSchema)  [finally, per-object]
   │     POST /api/agent/jobs/J/metrics
   │     (if all param sets failed: POST /api/agent/jobs/J/objects/{id}/execution-failed)
+  │   DropStagingSchemaAsync(stagingSchema)  [finally, job-level]
   │     ↓
   │   [job complete for this agent]
   │
-  ├─ ReadyToExecuteObjects.Count > 0  →  SubmitOptimizedMetricsAsync for each
-  │   (handles BenchmarkingComplete jobs picked up via poll without a pending job)
+  ├─ ReadyToExecuteObjects.Count > 0  →  group by JobId
+  │   for each job group:  [try]
+  │     SubmitOptimizedMetricsAsync for each object
+  │   DropStagingSchemaAsync(stagingSchema)  [finally, job-level]
   │
   └─ nothing pending  →  sleep PollIntervalSeconds, loop
 ```
@@ -343,8 +381,9 @@ The agent sends its version (`Assembly.GetExecutingAssembly().GetName().Version`
 - **Execution plan XML** is identified by the result set column name containing "XML Showplan" — this is SQL Server's convention for the Statistics XML result set.
 - **Missing index suggestions** are parsed from `<MissingIndexGroup>` elements in the plan XML.
 - **CommandTimeout**: 120s for crawl queries, 120s for execution, 60s for deploy, 30s for drop.
-- **The `[optimizer]` schema** is created in the customer database if absent. Used as a sandbox for running the optimized version. Always cleaned up in `finally`.
+- **Staging schema** (`dbopt_XXXXXX`) is created in the customer database per job, used as a sandbox for running the optimized version, and always dropped in a job-level `finally`. The name comes from the backend — never hardcoded or generated by the agent.
+- **SQL injection safety:** `EscapeIdentifier(value)` wraps in `[` `]` with `]` doubled. `EscapeStringLiteral(value)` wraps in `N'` `'` with `'` doubled. Both are used when building dynamic DDL for the staging schema.
 - **Server/database names** are masked before being sent to the backend: first char + last 3 chars, rest replaced with `*`. A SHA-256 hash of `serverName|databaseName` (lowercased) is also sent for identity matching without revealing the full names.
 - **`SubmitObjectMetricsAsync`** in `AgentWorker.cs` is dead code — it is never called. The active path is `SubmitOptimizedMetricsAsync`.
 - **Result set validation** (`ResultSetHasher`, `ExecutionValidation`) runs after both original and optimized execute. Failures are non-fatal — they populate informational DTO fields only.
-- **NuGet package** consumed is `SqlBrain.Contracts` (the published name), not `DbOptimizer.Contracts` (the project name in the backend repo). Keep these in sync when the Contracts project version bumps.
+- **NuGet package** consumed is `SqlBrain.Contracts` (the published name), not `DbOptimizer.Contracts` (the project name in the backend repo). Bump the version in `DbOptimizer.Agent.csproj` whenever any Contracts file changes.
