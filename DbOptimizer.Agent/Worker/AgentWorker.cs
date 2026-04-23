@@ -445,8 +445,12 @@ public class AgentWorker : BackgroundService
                 catch (Exception ex)
                 {
                     _logger.LogError(ex,
-                        "Job {JobId}: failed to deploy [{StagingSchema}].[{Object}] — optimized benchmarks will be skipped",
+                        "Job {JobId}: failed to deploy [{StagingSchema}].[{Object}] — reporting failure",
                         jobId, stagingSchema, obj.ObjectName);
+                    await _api.ReportExecutionFailedAsync(jobId, obj.Id,
+                        $"Optimized definition failed to deploy: {ex.Message}",
+                        stoppingToken);
+                    return;
                 }
             }
         }
