@@ -19,6 +19,7 @@ public class AgentWorker : BackgroundService
     private readonly SqlObjectExecutor _executor;
     private readonly AgentConfiguration _config;
     private readonly ILogger<AgentWorker> _logger;
+    private readonly IHostApplicationLifetime _lifetime;
 
     private static readonly TimeSpan ResultPollInterval = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan ResultPollTimeout  = TimeSpan.FromMinutes(30);
@@ -36,19 +37,24 @@ public class AgentWorker : BackgroundService
         SqlServerCrawler crawler,
         SqlObjectExecutor executor,
         IOptions<AgentConfiguration> config,
-        ILogger<AgentWorker> logger)
+        ILogger<AgentWorker> logger,
+        IHostApplicationLifetime lifetime)
     {
         _api      = api;
         _crawler  = crawler;
         _executor = executor;
         _config   = config.Value;
         _logger   = logger;
+        _lifetime = lifetime;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         _logger.LogInformation("AgentWorker started. Polling {BackendUrl} every {PollInterval}s",
             _config.BackendUrl, _config.PollIntervalSeconds);
+
+        try
+        {
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -137,6 +143,31 @@ public class AgentWorker : BackgroundService
             {
                 await DelayAsync(_config.PollIntervalSeconds, stoppingToken);
             }
+        }
+
+        } // end try
+        catch (AgentAuthException ex) when (!stoppingToken.IsCancellationRequested)
+        {
+            switch (ex.ErrorCode)
+            {
+                case "InvalidApiKey":
+                    _logger.LogError(
+                        "API key rejected — key may have been rotated. Reconfigure the agent with the new key.");
+                    break;
+                case "AgentDisabled":
+                    _logger.LogWarning(
+                        "This agent has been disabled from the dashboard. Contact your administrator.");
+                    break;
+                case "OrgSuspended":
+                    _logger.LogWarning(
+                        "Your organization account is suspended. Contact DbOptimizer support.");
+                    break;
+                default:
+                    _logger.LogError(
+                        "Authentication rejected by backend (error: {ErrorCode}). Stopping agent.", ex.ErrorCode);
+                    break;
+            }
+            _lifetime.StopApplication();
         }
 
         _logger.LogInformation("AgentWorker stopping.");

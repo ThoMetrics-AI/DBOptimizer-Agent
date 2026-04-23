@@ -27,7 +27,9 @@ public class BackendApiClient
 
     /// <summary>
     /// Polls the backend for pending work (POST so the body can carry SQL Server metadata).
-    /// Returns null if the response cannot be read.
+    /// Returns null on 204 NoContent or transient failures.
+    /// Throws <see cref="AgentAuthException"/> on 401 or 403 — these are non-retryable and
+    /// should stop the agent gracefully.
     /// </summary>
     public async Task<AgentPollResponse?> PollForJobAsync(AgentPollRequest request, CancellationToken cancellationToken)
     {
@@ -35,11 +37,26 @@ public class BackendApiClient
         {
             var response = await _httpClient.PostAsJsonAsync("api/agent/poll", request, cancellationToken);
 
+            if (response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                throw new AgentAuthException("InvalidApiKey");
+
+            if (response.StatusCode == System.Net.HttpStatusCode.Forbidden)
+            {
+                var body = await response.Content
+                    .ReadFromJsonAsync<System.Text.Json.JsonElement>(cancellationToken: cancellationToken);
+                var errorCode = body.TryGetProperty("error", out var prop) ? prop.GetString() ?? "Forbidden" : "Forbidden";
+                throw new AgentAuthException(errorCode);
+            }
+
             if (response.StatusCode == System.Net.HttpStatusCode.NoContent)
                 return null;
 
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadFromJsonAsync<AgentPollResponse>(cancellationToken: cancellationToken);
+        }
+        catch (AgentAuthException)
+        {
+            throw;
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
