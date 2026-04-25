@@ -61,7 +61,7 @@ dboptimizer-agent/
 
 ### External dependencies
 
-- **`SqlBrain.Contracts`** — NuGet package published from the backend's `DbOptimizer.Contracts` project. Provides all shared DTOs (`JobDto`, `JobObjectDto`, `ParameterSetDto`, `DiscoveredObjectDto`, `ExecutionResultDto`, `BaselineObjectResult`), request types, and `AgentPollResponse`. This is the only cross-repo dependency. **Bump the version in `DbOptimizer.Agent.csproj` whenever any file in `DbOptimizer.Contracts` changes.**
+- **`SqlBrain.Contracts`** (currently v1.0.21, next publish will be v1.0.22) — Public NuGet package published from the backend's `DbOptimizer.Contracts` project. Contains **only agent-consumed types**: `JobDto`, `JobObjectDto`, `ParameterSetDto`, `DiscoveredObjectDto`, `DiscoveredParameterDto`, `ExecutionResultDto`, `BaselineObjectResult`, request types, and `AgentPollResponse`. CRM/billing/proposal DTOs are intentionally excluded (they live in `DbOptimizer.Api/Dtos/Crm/` in the backend) to keep sensitive business data out of this public package. This is the only cross-repo dependency. **Bump the version in `DbOptimizer.Agent.csproj` whenever any file in `DbOptimizer.Contracts` changes.**
 - **`Microsoft.Data.SqlClient`** — Direct ADO.NET for all SQL Server access. No ORM.
 - No reference to `DbOptimizer.Core`, `DbOptimizer.Claude`, or `DbOptimizer.Infrastructure`.
 
@@ -144,17 +144,20 @@ Wrapped in a `try/finally`. For each `JobObjectDto` in the results: `SubmitOptim
 Executes both original and optimized versions for every parameter set and posts all results together.
 
 1. Read `stagingSchema = obj.StagingSchema`. If empty → log warning and skip (object came from a code path with no staging schema; should not happen).
-2. **Per-object pre-deploy collision check:** `SqlObjectExecutor.StagingObjectExistsAsync(stagingSchema, objectName)`. If the object already exists under the staging schema → call `ReportExecutionFailedAsync` with `skipRefund: true` (Claude already ran, credits are not refunded) → return early.
+2. **Per-object pre-deploy collision check:** `SqlObjectExecutor.StagingObjectExistsAsync(stagingSchema, objectName)`. If the object already exists under the staging schema → call `ReportExecutionFailedAsync` → return early.
 3. Determine parameter sets to use — `obj.ParameterSets` if present, otherwise a synthetic empty set.
-4. Deploy optimized version once: `SqlObjectExecutor.DeployUnderOptimizerSchemaAsync(stagingSchema, ...)` (reused for all param sets).
-5. For each parameter set:
+4. **Determinism probe:** `SqlObjectExecutor.ProbeIsDeterministicAsync(obj, firstParamSet.ParametersJson)` — runs the original object twice with identical parameters and compares result hashes. The `isDeterministic` result is passed to validation to skip checksums for non-deterministic objects.
+5. Deploy optimized version once: `SqlObjectExecutor.DeployUnderOptimizerSchemaAsync(stagingSchema, ...)` (reused for all param sets). If deploy fails → calls `ReportExecutionFailedAsync` and returns early.
+6. For each parameter set:
    - **Original execution:** `SqlObjectExecutor.ExecuteAndCaptureAsync(obj, parametersJson)` → `ExecutionResultDto` with `ExecutionVersionId = 1`.
    - If original fails → `continue` to next param set (optimized skipped for this set).
    - **Optimized execution:** `SqlObjectExecutor.ExecuteAndCaptureAsync(optimizerObj with SchemaName=stagingSchema, parametersJson)` → `ExecutionResultDto` with `ExecutionVersionId = 2`. Non-fatal — if optimized fails, original metrics are still posted.
-6. Cleanup: `SqlObjectExecutor.RemoveFromOptimizerSchemaAsync(stagingSchema, ...)` in `finally`.
-7. If `results.Count == 0` → call `ReportExecutionFailedAsync` (triggers credit refund).
-8. `BackendApiClient.SubmitMetricsAsync` → `POST /api/agent/jobs/{jobId}/metrics`.
-9. If submit fails → call `ReportExecutionFailedAsync`.
+   - **Sampled checksum:** If either side's result set exceeded `ChecksumRowThreshold`, calls `ComputeSampledChecksumAsync` for both sides and uses the sampled hashes for validation.
+   - **Validation:** `ExecutionValidation.Compare` with row counts, column schemas, checksums, float samples, and `isDeterministic` flag.
+7. Cleanup: `SqlObjectExecutor.RemoveFromOptimizerSchemaAsync(stagingSchema, ...)` in `finally`.
+8. If `results.Count == 0` → call `ReportExecutionFailedAsync`.
+9. `BackendApiClient.SubmitMetricsAsync` → `POST /api/agent/jobs/{jobId}/metrics`.
+10. If submit fails → call `ReportExecutionFailedAsync`.
 
 > **`SubmitObjectMetricsAsync`** (single-param-set version) still exists in `AgentWorker.cs` but is **dead code** — it is not called anywhere. The current path always goes through `SubmitOptimizedMetricsAsync`.
 
@@ -167,7 +170,7 @@ Each job gets a unique staging schema name (`dbopt_XXXXXX` where XXXXXX is 6 low
 **Lifecycle:**
 1. Backend generates the name at job creation and checks for collision at discovery time.
 2. Agent reads it from `obj.StagingSchema` on every `JobObjectDto`.
-3. Before deploying, agent calls `StagingObjectExistsAsync` to check if the object already exists under that schema — fails with `skipRefund: true` if it does.
+3. Before deploying, agent calls `StagingObjectExistsAsync` to check if the object already exists under that schema — calls `ReportExecutionFailedAsync(skipRefund: true)` if it does (though `skipRefund` is currently ignored by the backend since credits were removed).
 4. After all objects in a job complete (in `finally`), agent calls `DropStagingSchemaAsync` to drop the entire schema.
 
 **`SqlObjectExecutor` methods that take `stagingSchema`:**
@@ -207,8 +210,10 @@ Connects to the customer SQL Server and returns all crawlable objects.
 **`CrawlObjectsAsync` flow:**
 1. `GetServerInfoAsync` — `@@SERVERNAME`, `DB_NAME()`, `@@VERSION`, `CompatibilityLevel` via `DATABASEPROPERTYEX`. Returns a `ServerInfo` record cached on the worker.
 2. `GetProcedureFrequenciesAsync` — queries `sys.dm_exec_procedure_stats` for estimated executions per day (`SUM(execution_count) / DATEDIFF(DAY, cached_time, GETDATE())`). Only covers stored procedures. Silently swallows `SqlException` (e.g. `VIEW SERVER STATE` permission missing on SQL Express).
-3. Main query: `sys.objects JOIN sys.sql_modules JOIN sys.schemas` for types `P, V, FN, IF, TF`, excluding `is_ms_shipped = 1` objects.
-4. For each object: maps `sys.objects.type` code to `ObjectTypeId` (inlined constants — Core not referenced), looks up frequency, runs `ExtractHints`, crawls parameter metadata via `sys.parameters` for stored procedures, builds a `DiscoveredObjectDto`.
+3. `GetObjectsWithPermanentWritesAsync` — queries `sys.dm_sql_referenced_entities` via `CROSS APPLY` to identify objects that write to permanent tables (`is_updated = 1`). Excludes temp tables (`#`-prefixed). Returns a `HashSet<string>` of `"schema.name"` keys. Silently swallows `SqlException` (e.g. broken dependencies) and defaults all objects to `HasPermanentTableWrites = false`. The backend uses this flag during classification to mark objects as `HasWrites`.
+4. `GetParameterMetadataAsync` — queries `sys.parameters` for all crawled objects. Returns a dictionary mapping `"schema.name"` to `List<DiscoveredParameterDto>`. Constructs readable SQL type strings (e.g. `VARCHAR(MAX)`, `DECIMAL(18,4)`) with proper handling of nvarchar byte-length conversion.
+5. Main query: `sys.objects JOIN sys.sql_modules JOIN sys.schemas` for types `P, V, FN, IF, TF`, excluding `is_ms_shipped = 1` objects.
+6. For each object: maps `sys.objects.type` code to `ObjectTypeId` (inlined constants — Core not referenced), looks up frequency, runs `ExtractHints`, attaches parameter metadata and `HasPermanentTableWrites`, builds a `DiscoveredObjectDto`.
 
 **`GetSchemaNames()`:**
 Queries `SELECT name FROM sys.schemas` and returns all schema names. Called during `RunDiscoveryAsync` and passed to the backend as `ExistingSchemaNames` in `PostAgentDiscoveryRequest` so the backend can check the generated staging schema name for collisions. Swallows `SqlException` with a warning log and returns an empty list on failure.
@@ -224,7 +229,7 @@ Queries `SELECT name FROM sys.schemas` and returns all schema names. Called duri
 
 > These constants are inlined in the crawler rather than imported from `DbOptimizer.Core`, because the agent does not reference Core. They must stay in sync with `ObjectTypeIds` in the backend.
 
-**Parameter metadata** is crawled from `sys.parameters` for stored procedures and stored in `DiscoveredObjectDto.Parameters`. The backend's `ParameterOptionalityParser` determines which are optional from the SP definition. This JSON ends up in `JobObject.ParametersJson` and is used by the AI parameter generation feature.
+**Parameter metadata** is crawled via `GetParameterMetadataAsync` from `sys.parameters` for stored procedures and stored in `DiscoveredObjectDto.Parameters`. The backend's `ParameterOptionalityParser` determines which are optional from the SP definition. This JSON ends up in `JobObject.ParametersJson` and is used by the AI parameter generation feature.
 
 ---
 
@@ -272,20 +277,32 @@ Queries `sys.objects JOIN sys.schemas` with parameterized SQL to check if an obj
 
 Executes `DROP SCHEMA IF EXISTS [escapedSchema]`. Called in the job-level `finally` block after all objects in a job have been processed (regardless of success or failure). Cleans up the entire staging schema at once.
 
+### `ProbeIsDeterministicAsync(jobObject, parametersJson, ct)`
+
+Executes the original object twice with identical resolved parameter values and compares XxHash64 hashes of the result sets. Returns `true` if both hashes match (deterministic), `false` if they differ (non-deterministic, e.g. NEWID(), GETDATE()). Parameters with `$query` envelopes are resolved once and reused for both runs so a randomized sampling query does not create a false non-determinism signal. Each run uses its own connection to avoid temp-table conflicts. Called once per object before benchmarking — the result is passed to `ExecutionValidation.Compare` to skip checksum validation for non-deterministic objects.
+
+### `ComputeSampledChecksumAsync(jobObject, parametersJson, totalRows, ct)`
+
+Re-executes the object and computes an XxHash64 over a 3-band statistical sample (first 500 rows, middle 500 rows, last 500 rows). Used when `ExecuteAndCaptureAsync` reports `ChecksumThresholdExceeded` (result set larger than `ChecksumRowThreshold`, default 10,000 rows) so that large result sets still get a meaningful checksum comparison. The `totalRows` parameter (from the earlier execution) is used to position the middle and last bands.
+
 ---
 
 ## Result Set Validation
 
 When both original and optimized versions execute successfully, the agent validates that the optimized version returns equivalent results. Validation runs inside `SubmitOptimizedMetricsAsync` and populates fields on `ExecutionResultDto`.
 
-**`ExecutionValidation.cs`** — compares:
+**Determinism probe:** Before benchmarking each object, `ProbeIsDeterministicAsync` runs the original object twice with identical parameters and compares result hashes. If non-deterministic (`isDeterministic = false`), checksum validation is skipped entirely to avoid false mismatches from objects using NEWID(), GETDATE(), etc.
+
+**`ExecutionValidation.cs`** — `Compare` method:
 - **Row count** (`RowCountMatch`) — original vs. optimized row counts must match exactly.
 - **Column schema** (`ColumnSchemaMatch`) — column names and types must match (order-insensitive).
-- **Checksum** (`ChecksumMatch`) — hash of result data. For non-deterministic objects (random, NEWID, etc.) checksums are skipped and `IsDeterministic=false` is recorded.
+- **Checksum** (`ChecksumMatch`) — hash of result data. Skipped if `isDeterministic = false`.
+- Skips validation entirely if either side has no result set.
 
 **`ResultSetHasher.cs`** — computes checksums:
+- `HashCurrentResultSetAsync`: Streams XxHash64 over the result set. Excludes imprecise types (float, real, money) from the hash. Stops hashing at `ChecksumRowThreshold` rows but continues counting; sets `ThresholdExceeded = true` if exceeded. Captures up to 500 float column values for approximate comparison.
 - Rows ≤ `ChecksumRowThreshold` (default 10,000): full checksum over all rows.
-- Rows > threshold: sampled checksum; `UsedSampledChecksum=true` is recorded.
+- Rows > threshold: `ComputeSampledChecksumAsync` is called separately — re-executes the object and hashes a 3-band sample (first 500, middle 500, last 500 rows). `UsedSampledChecksum=true` is recorded.
 - Float columns are compared with epsilon tolerance (`FloatEpsilon`, default 0.0001). When floats differ only within tolerance, `FloatColumnsApproximatelyEqual=true` is set even if the checksum technically mismatches.
 - When checksum includes columns that were excluded due to imprecise types, `ChecksumExcludedImpreciseColumns=true` is recorded.
 
@@ -306,7 +323,7 @@ Thin HTTP client. `X-Agent-ApiKey` is added to `DefaultRequestHeaders` at constr
 | `SubmitBaselinesAsync` | `POST /api/agent/jobs/{id}/baselines` | Returns false on exception |
 | `PollForResultsAsync` | `GET /api/agent/jobs/{id}/results` | Returns null on exception, `204 NoContent`, or `200 []` |
 | `SubmitMetricsAsync` | `POST /api/agent/jobs/{id}/metrics` | Returns false on exception |
-| `ReportExecutionFailedAsync(jobId, objectId, reason, ct, skipRefund)` | `POST /api/agent/jobs/{id}/objects/{oid}/execution-failed` | `skipRefund: true` for staging collision (Claude ran, credits not returned) |
+| `ReportExecutionFailedAsync(jobId, objectId, reason, ct, skipRefund)` | `POST /api/agent/jobs/{id}/objects/{oid}/execution-failed` | Sends `{ reason, skipRefund }` — backend marks object Failed. `skipRefund` is sent but currently ignored by the backend (credit system removed). |
 | `SendHeartbeatAsync` | `POST /api/agent/heartbeat` | Returns false on exception |
 
 ---
@@ -337,11 +354,15 @@ POST /api/agent/poll  (body: AgentPollRequest with version + masked server metad
   │     → 200+objects   → proceed to Phase 3
   │     ↓
   │   Phase 3: SubmitOptimizedMetricsAsync for each optimized object  [try]
-  │     StagingObjectExistsAsync → if exists: ReportExecutionFailed(skipRefund:true), skip
+  │     StagingObjectExistsAsync → if exists: ReportExecutionFailed, skip
+  │     ProbeIsDeterministicAsync(original, firstParamSet) → isDeterministic
   │     DeployUnderOptimizerSchemaAsync(stagingSchema)
+  │       (if deploy fails: ReportExecutionFailed, return early)
   │     for each ParameterSet:
   │       ExecuteAndCaptureAsync(original)  → ExecutionVersionId=1
   │       ExecuteAndCaptureAsync([stagingSchema].[name])  → ExecutionVersionId=2
+  │       (if threshold exceeded: ComputeSampledChecksumAsync for both sides)
+  │       ExecutionValidation.Compare(isDeterministic, ...)
   │     RemoveFromOptimizerSchemaAsync(stagingSchema)  [finally, per-object]
   │     POST /api/agent/jobs/J/metrics
   │     (if all param sets failed: POST /api/agent/jobs/J/objects/{id}/execution-failed)
@@ -403,7 +424,10 @@ The agent sends its version (`Assembly.GetExecutingAssembly().GetName().Version`
 - **Staging schema** (`dbopt_XXXXXX`) is created in the customer database per job, used as a sandbox for running the optimized version, and always dropped in a job-level `finally`. The name comes from the backend — never hardcoded or generated by the agent.
 - **SQL injection safety:** `EscapeIdentifier(value)` wraps in `[` `]` with `]` doubled. `EscapeStringLiteral(value)` wraps in `N'` `'` with `'` doubled. Both are used when building dynamic DDL for the staging schema.
 - **Server/database names** are masked before being sent to the backend: first char + last 3 chars, rest replaced with `*`. A SHA-256 hash of `serverName|databaseName` (lowercased) is also sent for identity matching without revealing the full names.
-- **Deploy failures are reported, not skipped.** If `DeployUnderOptimizerSchemaAsync` throws in `SubmitOptimizedMetricsAsync`, the method calls `ReportExecutionFailedAsync` (triggering a credit refund) and returns early — it does not attempt to benchmark with partial results.
+- **Deploy failures are reported, not skipped.** If `DeployUnderOptimizerSchemaAsync` throws in `SubmitOptimizedMetricsAsync`, the method calls `ReportExecutionFailedAsync` and returns early — it does not attempt to benchmark with partial results.
 - **`SubmitObjectMetricsAsync`** in `AgentWorker.cs` is dead code — it is never called. The active path is `SubmitOptimizedMetricsAsync`.
 - **Result set validation** (`ResultSetHasher`, `ExecutionValidation`) runs after both original and optimized execute. Failures are non-fatal — they populate informational DTO fields only.
+- **Determinism probe** runs before benchmarking each object — executes twice with identical resolved parameters and compares XxHash64. If non-deterministic, checksum validation is skipped to avoid false failures from NEWID(), GETDATE(), etc. Parameters are resolved once and reused for both probe runs.
+- **Permanent table writes detection** via `GetObjectsWithPermanentWritesAsync` uses `sys.dm_sql_referenced_entities` with `is_updated = 1`. Sets `HasPermanentTableWrites` on `DiscoveredObjectDto` so the backend classifier can identify write-heavy objects via DMV data rather than pure static analysis. Silently defaults to `false` if the DMV call fails (e.g. broken dependencies).
+- **Sampled checksum** for large result sets: when row count exceeds `ChecksumRowThreshold`, `ComputeSampledChecksumAsync` re-executes and hashes 3 bands of 500 rows (first, middle, last). Both original and optimized are sampled for comparison.
 - **NuGet package** consumed is `SqlBrain.Contracts` (the published name), not `DbOptimizer.Contracts` (the project name in the backend repo). Bump the version in `DbOptimizer.Agent.csproj` whenever any Contracts file changes.
