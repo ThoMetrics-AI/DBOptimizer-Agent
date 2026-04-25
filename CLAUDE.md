@@ -1,5 +1,11 @@
 # CLAUDE.md — dboptimizer-agent (On-Premise Agent)
 
+## Do NOT Add or Update Tests
+
+Do not create, modify, or add unit tests, integration tests, or any test files. The codebase is in active feature development — tests will be written later as a dedicated pass with complete code coverage. This applies even if a code change would normally warrant a test update.
+
+---
+
 ## Build & Run
 
 ```bash
