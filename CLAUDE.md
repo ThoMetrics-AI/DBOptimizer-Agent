@@ -67,7 +67,7 @@ dboptimizer-agent/
 
 ### External dependencies
 
-- **`SqlBrain.Contracts`** (currently v1.0.21, next publish will be v1.0.22) — Public NuGet package published from the backend's `DbOptimizer.Contracts` project. Contains **only agent-consumed types**: `JobDto`, `JobObjectDto`, `ParameterSetDto`, `DiscoveredObjectDto`, `DiscoveredParameterDto`, `ExecutionResultDto`, `BaselineObjectResult`, request types, and `AgentPollResponse`. CRM/billing/proposal DTOs are intentionally excluded (they live in `DbOptimizer.Api/Dtos/Crm/` in the backend) to keep sensitive business data out of this public package. This is the only cross-repo dependency. **Bump the version in `DbOptimizer.Agent.csproj` whenever any file in `DbOptimizer.Contracts` changes.**
+- **`SqlBrain.Contracts`** (currently v1.0.22) — Public NuGet package published from the backend's `DbOptimizer.Contracts` project. Contains **only agent-consumed types**: `JobDto`, `JobObjectDto`, `ParameterSetDto`, `DiscoveredObjectDto`, `DiscoveredParameterDto`, `ExecutionResultDto`, `BaselineObjectResult`, request types, and `AgentPollResponse`. CRM/billing/proposal DTOs are intentionally excluded (they live in `DbOptimizer.Api/Dtos/Crm/` in the backend) to keep sensitive business data out of this public package. This is the only cross-repo dependency. **Bump the version in `DbOptimizer.Agent.csproj` whenever any file in `DbOptimizer.Contracts` changes.**
 - **`Microsoft.Data.SqlClient`** — Direct ADO.NET for all SQL Server access. No ORM.
 - No reference to `DbOptimizer.Core`, `DbOptimizer.Claude`, or `DbOptimizer.Infrastructure`.
 
@@ -83,8 +83,7 @@ All settings live in `appsettings.json` under the `"Agent"` section (`AgentConfi
 
 | Key | Purpose | Code Default | appsettings.json |
 |-----|---------|-------------|-----------------|
-| `AgentId` | Numeric ID assigned by backend at registration | — | placeholder |
-| `BackendUrl` | Base URL of the SaaS API, e.g. `https://api.dboptimizer.com` | — | placeholder |
+| `BackendUrl` | Base URL of the SaaS API, e.g. `https://api.sqlbrain.ai` | — | placeholder |
 | `ApiKey` | API key issued on registration. Sent as `X-Agent-ApiKey` header | — | placeholder |
 | `SqlConnectionString` | Connection string to the customer SQL Server | — | placeholder |
 | `PollIntervalSeconds` | How often to poll for new jobs (when idle) | 15 | **10** |
@@ -93,7 +92,7 @@ All settings live in `appsettings.json` under the `"Agent"` section (`AgentConfi
 | `ChecksumRowThreshold` | Max rows before switching to sampled checksum | 10,000 | — |
 | `FloatEpsilon` | Tolerance for comparing floating-point result values | 0.0001 | — |
 
-The installer writes `AgentId`, `BackendUrl`, `ApiKey`, and `SqlConnectionString` on first run. `appsettings.json` in the repo overrides poll and heartbeat intervals to be more aggressive than the code defaults.
+The installer writes `BackendUrl`, `ApiKey`, and `SqlConnectionString` on first run. `appsettings.json` in the repo overrides poll and heartbeat intervals to be more aggressive than the code defaults.
 
 ---
 
