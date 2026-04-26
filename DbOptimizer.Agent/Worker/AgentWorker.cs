@@ -17,6 +17,7 @@ public class AgentWorker : BackgroundService
     private readonly BackendApiClient _api;
     private readonly SqlServerCrawler _crawler;
     private readonly SqlObjectExecutor _executor;
+    private readonly CapabilityChecker _capabilityChecker;
     private readonly AgentConfiguration _config;
     private readonly ILogger<AgentWorker> _logger;
     private readonly IHostApplicationLifetime _lifetime;
@@ -36,6 +37,7 @@ public class AgentWorker : BackgroundService
         BackendApiClient api,
         SqlServerCrawler crawler,
         SqlObjectExecutor executor,
+        CapabilityChecker capabilityChecker,
         IOptions<AgentConfiguration> config,
         ILogger<AgentWorker> logger,
         IHostApplicationLifetime lifetime)
@@ -43,6 +45,7 @@ public class AgentWorker : BackgroundService
         _api      = api;
         _crawler  = crawler;
         _executor = executor;
+        _capabilityChecker = capabilityChecker;
         _config   = config.Value;
         _logger   = logger;
         _lifetime = lifetime;
@@ -98,6 +101,12 @@ public class AgentWorker : BackgroundService
             if (poll.DiscoveryJobId.HasValue)
             {
                 await RunDiscoveryAsync(poll.DiscoveryJobId.Value, stoppingToken);
+                continue;
+            }
+
+            if (poll.RunCapabilityCheck && poll.PendingCapabilityCheckId.HasValue)
+            {
+                await RunCapabilityCheckAsync(poll.PendingCapabilityCheckId.Value, stoppingToken);
                 continue;
             }
 
@@ -206,6 +215,45 @@ public class AgentWorker : BackgroundService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Discovery: unhandled exception — returning to polling");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Capability Check
+    // -------------------------------------------------------------------------
+
+    private async Task RunCapabilityCheckAsync(int checkId, CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("Running capability check {CheckId}", checkId);
+
+        try
+        {
+            await _api.StartCapabilityCheckAsync(checkId, stoppingToken);
+
+            var results = await _capabilityChecker.RunAllAsync(stoppingToken);
+
+            var steps = results.Select(r => (object)new
+            {
+                StepId = r.StepId,
+                Passed = r.Passed,
+                ErrorMessage = r.ErrorMessage,
+                DurationMs = r.DurationMs
+            }).ToList();
+
+            await _api.PostCapabilityCheckResultsAsync(checkId, steps, stoppingToken);
+
+            var allPassed = results.All(r => r.Passed);
+            _logger.LogInformation("Capability check {CheckId} completed: {Status} ({PassedCount}/{TotalCount} steps passed)",
+                checkId, allPassed ? "PASSED" : "FAILED", results.Count(r => r.Passed), results.Count);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("Capability check cancelled");
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Capability check {CheckId}: unhandled exception — returning to polling", checkId);
         }
     }
 

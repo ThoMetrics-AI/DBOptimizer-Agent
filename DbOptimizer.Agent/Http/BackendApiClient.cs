@@ -231,6 +231,48 @@ public class BackendApiClient
     }
 
     /// <summary>
+    /// Notifies the backend that a capability check has started.
+    /// </summary>
+    public async Task<bool> StartCapabilityCheckAsync(int checkId, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var response = await _httpClient.PostAsJsonAsync(
+                $"api/agent/capability-checks/{checkId}/start",
+                new { },
+                cancellationToken);
+            response.EnsureSuccessStatusCode();
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogError(ex, "Error starting capability check {CheckId}", checkId);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Posts capability check step results to the backend.
+    /// </summary>
+    public async Task<bool> PostCapabilityCheckResultsAsync(int checkId, List<object> steps, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var response = await _httpClient.PostAsJsonAsync(
+                $"api/agent/capability-checks/{checkId}/results",
+                new { Steps = steps },
+                cancellationToken);
+            response.EnsureSuccessStatusCode();
+            return true;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogError(ex, "Error posting capability check results for {CheckId}", checkId);
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Sends a heartbeat to the backend to signal the agent is alive.
     /// </summary>
     public async Task<bool> SendHeartbeatAsync(HeartbeatRequest heartbeat, CancellationToken cancellationToken)

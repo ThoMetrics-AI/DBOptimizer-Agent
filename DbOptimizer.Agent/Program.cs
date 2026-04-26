@@ -26,6 +26,13 @@ builder.Services.AddSingleton<SqlObjectExecutor>(sp =>
     return new SqlObjectExecutor(config, logger);
 });
 
+builder.Services.AddSingleton<CapabilityChecker>(sp =>
+{
+    var config = sp.GetRequiredService<IOptions<AgentConfiguration>>().Value;
+    var logger = sp.GetRequiredService<ILogger<CapabilityChecker>>();
+    return new CapabilityChecker(config.SqlConnectionString, logger);
+});
+
 builder.Services.AddHostedService<AgentWorker>();
 
 var host = builder.Build();

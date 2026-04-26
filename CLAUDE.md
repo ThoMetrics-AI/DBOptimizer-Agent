@@ -51,6 +51,7 @@ dboptimizer-agent/
     Crawling/
       SqlServerCrawler.cs       — Crawls sys.objects/sys.sql_modules, queries DMVs for frequencies; GetSchemaNames() queries sys.schemas
       SqlObjectExecutor.cs      — Deploys to staging schema, executes, captures metrics, resolves $query params
+      CapabilityChecker.cs      — 7-step preflight check proving agent has required SQL Server permissions
       ResultSetHasher.cs        — Checksum computation for result sets; supports sampled hashing for large sets
       ExecutionValidation.cs    — Row count and column schema comparison between original and optimized executions
     Http/
@@ -58,7 +59,7 @@ dboptimizer-agent/
       AgentAuthException.cs     — Exception for 401/403 responses; carries ErrorCode (InvalidApiKey, AgentDisabled, OrgSuspended)
     Worker/
       AgentWorker.cs            — Main BackgroundService poll loop
-    Program.cs                  — Host setup: registers SqlServerCrawler, SqlObjectExecutor, BackendApiClient, AgentWorker
+    Program.cs                  — Host setup: registers SqlServerCrawler, SqlObjectExecutor, CapabilityChecker, BackendApiClient, AgentWorker
 
   DbOptimizer.Agent.Installer/  — Inno Setup project
                                    Wraps the published binary into a Windows .exe installer,
@@ -67,7 +68,7 @@ dboptimizer-agent/
 
 ### External dependencies
 
-- **`SqlBrain.Contracts`** (currently v1.0.22) — Public NuGet package published from the backend's `DbOptimizer.Contracts` project. Contains **only agent-consumed types**: `JobDto`, `JobObjectDto`, `ParameterSetDto`, `DiscoveredObjectDto`, `DiscoveredParameterDto`, `ExecutionResultDto`, `BaselineObjectResult`, request types, and `AgentPollResponse`. CRM/billing/proposal DTOs are intentionally excluded (they live in `DbOptimizer.Api/Dtos/Crm/` in the backend) to keep sensitive business data out of this public package. This is the only cross-repo dependency. **Bump the version in `DbOptimizer.Agent.csproj` whenever any file in `DbOptimizer.Contracts` changes.**
+- **`SqlBrain.Contracts`** (currently v1.0.23) — Public NuGet package published from the backend's `DbOptimizer.Contracts` project. Contains **only agent-consumed types**: `JobDto`, `JobObjectDto`, `ParameterSetDto`, `DiscoveredObjectDto`, `DiscoveredParameterDto`, `ExecutionResultDto`, `BaselineObjectResult`, request types, and `AgentPollResponse`. CRM/billing/proposal DTOs are intentionally excluded (they live in `DbOptimizer.Api/Dtos/Crm/` in the backend) to keep sensitive business data out of this public package. This is the only cross-repo dependency. **Bump the version in `DbOptimizer.Agent.csproj` whenever any file in `DbOptimizer.Contracts` changes.**
 - **`Microsoft.Data.SqlClient`** — Direct ADO.NET for all SQL Server access. No ORM.
 - No reference to `DbOptimizer.Core`, `DbOptimizer.Claude`, or `DbOptimizer.Infrastructure`.
 
@@ -330,6 +331,8 @@ Thin HTTP client. `X-Agent-ApiKey` is added to `DefaultRequestHeaders` at constr
 | `SubmitMetricsAsync` | `POST /api/agent/jobs/{id}/metrics` | Returns false on exception |
 | `ReportExecutionFailedAsync(jobId, objectId, reason, ct, skipRefund)` | `POST /api/agent/jobs/{id}/objects/{oid}/execution-failed` | Sends `{ reason, skipRefund }` — backend marks object Failed. `skipRefund` is sent but currently ignored by the backend (credit system removed). |
 | `SendHeartbeatAsync` | `POST /api/agent/heartbeat` | Returns false on exception |
+| `StartCapabilityCheckAsync` | `POST /api/agent/capability-checks/{id}/start` | Returns false on exception |
+| `PostCapabilityCheckResultsAsync` | `POST /api/agent/capability-checks/{id}/results` | Returns false on exception |
 
 ---
 
@@ -341,6 +344,7 @@ Thin HTTP client. `X-Agent-ApiKey` is added to `DefaultRequestHeaders` at constr
 POST /api/agent/poll  (body: AgentPollRequest with version + masked server metadata)
   ├─ MustUpdate=true       →  stop service
   ├─ RunDiscovery=true     →  GetSchemaNames → CrawlObjectsAsync → POST /api/agent/discovery → continue
+  ├─ RunCapabilityCheck=true → POST start → CapabilityChecker.RunAllAsync → POST results → continue
   ├─ PendingJobs[0] = job J  →  ProcessJobAsync(J)
   │     ↓
   │   POST /api/agent/jobs/J/start
